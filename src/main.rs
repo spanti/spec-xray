@@ -3,6 +3,7 @@ mod report;
 mod schema;
 
 use anyhow::{Context, Result, bail};
+use arboard::Clipboard;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -16,6 +17,10 @@ struct Cli {
     /// 单步上下文激增警告阈值（tokens）
     #[arg(long, global = true, default_value_t = 10_000)]
     threshold: u64,
+
+    /// 将诊断报告直接写入系统剪贴板（不重复输出到终端）
+    #[arg(long, global = true)]
+    copy: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -52,13 +57,28 @@ fn main() -> Result<()> {
             let sessions = analyzer::list_sessions(&proj_dir)?;
             let (latest_id, _) = sessions.first().context("当前项目下没有任何会话日志")?;
             let rep = analyzer::analyze_session(&proj_dir, latest_id, cli.threshold)?;
-            print!("{}", report::render_markdown(&rep));
+            emit_report(&report::render_markdown(&rep), cli.copy)?;
         }
         Commands::Inspect { session_id } => {
             let rep = analyzer::analyze_session(&proj_dir, &session_id, cli.threshold)?;
-            print!("{}", report::render_markdown(&rep));
+            emit_report(&report::render_markdown(&rep), cli.copy)?;
         }
     }
 
+    Ok(())
+}
+
+fn emit_report(markdown: &str, to_clipboard: bool) -> Result<()> {
+    if !to_clipboard {
+        print!("{markdown}");
+        return Ok(());
+    }
+
+    let mut clipboard = Clipboard::new().context("初始化系统剪贴板失败")?;
+    clipboard
+        .set_text(markdown.to_owned())
+        .context("写入诊断报告到剪贴板失败")?;
+
+    eprintln!("诊断报告已复制到系统剪贴板。");
     Ok(())
 }

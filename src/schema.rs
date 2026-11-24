@@ -12,6 +12,8 @@ pub struct RawLine {
     pub git_branch: Option<String>,
     #[serde(rename = "isSidechain")]
     pub is_sidechain: Option<bool>,
+    #[serde(rename = "parentToolUseID")]
+    pub parent_tool_use_id: Option<String>,
     pub message: Option<MessageBody>,
 }
 
@@ -52,6 +54,6 @@ impl Usage {
 pub struct ToolInvocation {
     pub id: String,
     pub name: String,
-    pub target: Option<String>, // 文件路径 / 搜索模式 / Bash 命令摘要
-    pub has_line_limit: bool,   // Read 工具是否指定了 offset/limit
+    pub target: Option<String>,
+    pub has_line_limit: bool,
 }

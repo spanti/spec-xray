@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default)]
 pub struct AgentReport {
     pub agent_id: String,
+    /// 从主会话 Task/Agent 调用提取的任务描述（如 Ticket 标题）
+    pub task_desc: Option<String>,
     pub is_main: bool,
     pub branch: Option<String>,
     pub turns: usize,
     pub startup_cache_tokens: u64,
     pub peak_context_tokens: u64,
     pub total_tokens: u64,
-    /// 工具名 -> 累计触发的上下文增长估算
+    /// 工具名 -> 累计触发的上下文增量估算
     pub tool_token_delta: HashMap<String, u64>,
     /// 单次大体积噪音操作：(工具/目标, 增量 tokens)
     pub heavy_ops: Vec<(String, u64)>,
@@ -27,6 +29,8 @@ pub struct AgentReport {
     pub failed_commands: Vec<(String, String)>,
     /// 连续失败死循环次数（连续 >=3 次失败记为风暴）
     pub max_consecutive_failures: usize,
+    /// 内部使用：派发的 subagent_id -> 任务描述映射
+    pub spawned_tasks: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -34,7 +38,7 @@ pub struct SessionReport {
     pub project_dir: PathBuf,
     pub session_id: String,
     pub agents: Vec<AgentReport>,
-    /// 跨 Agent 文件修改碰撞：文件路径 -> 修改过该文件的 agent_id 列表
+    /// 跨 Agent 文件修改碰撞：文件路径 -> 修改过该文件的显示名称列表
     pub file_clashes: BTreeMap<String, Vec<String>>,
 }
 
@@ -42,7 +46,6 @@ pub struct SessionReport {
 pub fn resolve_project_dir(work_dir: &Path) -> Result<PathBuf> {
     let abs = fs::canonicalize(work_dir).unwrap_or_else(|_| work_dir.to_path_buf());
     let raw_str = abs.to_string_lossy();
-    // 剥离 Windows fs::canonicalize 产生的 \\?\ 前缀
     let clean_str = raw_str.strip_prefix(r"\\?\").unwrap_or(&raw_str);
 
     let encoded: String = clean_str
@@ -57,7 +60,6 @@ pub fn resolve_project_dir(work_dir: &Path) -> Result<PathBuf> {
         return Ok(exact_dir);
     }
 
-    // Windows 盘符大小写兼容匹配（如 E--... vs e--...）
     if let Ok(entries) = fs::read_dir(&projects_root) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().eq_ignore_ascii_case(&encoded) {
@@ -93,10 +95,11 @@ pub fn analyze_session(proj_dir: &Path, session_id: &str, heavy_threshold: u64) 
         bail!("主会话日志不存在: {}", main_file.display());
     }
 
-    let mut agents = Vec::new();
-    agents.push(analyze_single_jsonl(&main_file, "main", true, heavy_threshold)?);
+    let main_report = analyze_single_jsonl(&main_file, "main", true, heavy_threshold)?;
+    let task_desc_map = main_report.spawned_tasks.clone();
 
-    // 扫描 <session-id>/subagents/agent-*.jsonl
+    let mut agents = vec![main_report];
+
     let subagents_dir = proj_dir.join(session_id).join("subagents");
     if subagents_dir.is_dir() {
         let mut sub_files: Vec<PathBuf> = fs::read_dir(&subagents_dir)?
@@ -106,23 +109,32 @@ pub fn analyze_session(proj_dir: &Path, session_id: &str, heavy_threshold: u64) 
         sub_files.sort();
 
         for sub_path in sub_files {
-            let agent_id = sub_path
+            let file_stem = sub_path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown-subagent")
                 .to_string();
-            agents.push(analyze_single_jsonl(&sub_path, &agent_id, false, heavy_threshold)?);
+            let raw_id = file_stem.strip_prefix("agent-").unwrap_or(&file_stem);
+            let mut sub_rep = analyze_single_jsonl(&sub_path, &file_stem, false, heavy_threshold)?;
+            sub_rep.task_desc = task_desc_map
+                .get(raw_id)
+                .or_else(|| task_desc_map.get(&file_stem))
+                .cloned();
+            agents.push(sub_rep);
         }
     }
 
-    // 计算跨 Agent 文件修改交集（排除 main 仅比较多个 agent，或包含所有修改者）
     let mut file_editors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for agent in &agents {
+        let display_name = match &agent.task_desc {
+            Some(desc) => format!("`{}` ({})", agent.agent_id, desc),
+            None => format!("`{}`", agent.agent_id),
+        };
         for file in &agent.edited_files {
             file_editors
                 .entry(file.clone())
                 .or_default()
-                .push(agent.agent_id.clone());
+                .push(display_name.clone());
         }
     }
     let file_clashes: BTreeMap<String, Vec<String>> = file_editors
@@ -177,7 +189,6 @@ fn analyze_single_jsonl(
 
         let Some(msg) = raw.message else { continue };
 
-        // 1. 统计 Token（严格按 message.id / uuid 去重）
         if let Some(usage) = msg.usage {
             let dedup_key = msg.id.clone().or(raw.uuid.clone());
             let is_new = dedup_key.map(|k| seen_msg_ids.insert(k)).unwrap_or(true);
@@ -188,7 +199,6 @@ fn analyze_single_jsonl(
                 if report.turns == 1 {
                     report.startup_cache_tokens = usage.cache_creation_input_tokens;
                 } else if ctx > prev_context_size && !last_tools.is_empty() {
-                    // 将本轮上下文增量均摊归因到上一轮触发的工具上
                     let delta = ctx - prev_context_size;
                     let share = delta / (last_tools.len() as u64);
                     for tool in &last_tools {
@@ -210,7 +220,6 @@ fn analyze_single_jsonl(
             }
         }
 
-        // 2. 解析 content 数组中的 tool_use 与 tool_result
         let Some(Value::Array(blocks)) = msg.content else {
             continue;
         };
@@ -250,18 +259,23 @@ fn analyze_single_jsonl(
                 "tool_result" => {
                     let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
                     let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if let Some(inv) = pending_tools.remove(tool_use_id)
-                        && inv.name == "Bash"
-                    {
-                        if is_error {
-                            current_fail_streak += 1;
-                            report.max_consecutive_failures =
-                                report.max_consecutive_failures.max(current_fail_streak);
-                            let snippet = extract_result_snippet(block.get("content"));
-                            let cmd = inv.target.unwrap_or_else(|| "bash".into());
-                            report.failed_commands.push((cmd, snippet));
-                        } else {
-                            current_fail_streak = 0;
+                    if let Some(inv) = pending_tools.remove(tool_use_id) {
+                        if inv.name == "Bash" {
+                            if is_error {
+                                current_fail_streak += 1;
+                                report.max_consecutive_failures =
+                                    report.max_consecutive_failures.max(current_fail_streak);
+                                let snippet = extract_result_snippet(block.get("content"));
+                                let cmd = inv.target.unwrap_or_else(|| "bash".into());
+                                report.failed_commands.push((cmd, snippet));
+                            } else {
+                                current_fail_streak = 0;
+                            }
+                        } else if (inv.name == "Task" || inv.name == "Agent")
+                            && let Some(desc) = inv.target
+                            && let Some(sub_id) = extract_spawned_agent_id(block.get("content"))
+                        {
+                            report.spawned_tasks.insert(sub_id, desc);
                         }
                     }
                 }
@@ -300,8 +314,39 @@ fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bo
                 .map(|s| s.lines().next().unwrap_or("").chars().take(72).collect());
             (cmd, false)
         }
+        "Task" | "Agent" => {
+            let desc = obj
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().take(48).collect());
+            (desc, false)
+        }
         _ => (None, false),
     }
+}
+
+/// 从 Task/Agent 的 tool_result 文本中提取 "agentId: xxxxx"
+fn extract_spawned_agent_id(content: Option<&Value>) -> Option<String> {
+    let text = match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("agentId:") {
+            let id = rest.trim().trim_matches('"').trim_matches('\'');
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn extract_result_snippet(content: Option<&Value>) -> String {
