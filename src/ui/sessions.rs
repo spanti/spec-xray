@@ -40,6 +40,7 @@ pub enum SessionStatus {
     Fail,
     Warn,
     Ok,
+    Empty,
 }
 
 impl SessionStatus {
@@ -49,6 +50,7 @@ impl SessionStatus {
             Self::Fail => "[FAIL]",
             Self::Warn => "[WARN]",
             Self::Ok => "[OK]",
+            Self::Empty => "[EMPTY]",
         }
     }
 }
@@ -116,7 +118,12 @@ impl ProjectSessions {
                 prompt: scan.prompt.unwrap_or_else(|| "-".into()),
             });
         }
-        sessions.sort_by(|a, b| b.last.cmp(&a.last).then_with(|| a.id.cmp(&b.id)));
+        sessions.sort_by(|a, b| {
+            a.is_empty()
+                .cmp(&b.is_empty())
+                .then_with(|| b.last.cmp(&a.last))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(Self { sessions })
     }
 
@@ -144,12 +151,18 @@ impl ProjectSessions {
 }
 
 impl SessionSummary {
+    pub fn is_empty(&self) -> bool {
+        self.turns == 0 && self.tokens == 0
+    }
+
     pub fn is_live(&self, now: DateTime<Utc>) -> bool {
         !self.ended && (0..90).contains(&now.signed_duration_since(self.last).num_seconds())
     }
 
     pub fn status(&self, now: DateTime<Utc>) -> SessionStatus {
-        if self.is_live(now) {
+        if self.is_empty() {
+            SessionStatus::Empty
+        } else if self.is_live(now) {
             SessionStatus::Live
         } else if self.failed {
             SessionStatus::Fail
@@ -162,22 +175,36 @@ impl SessionSummary {
 
     pub fn time_range(&self, now: DateTime<Utc>) -> String {
         let live = self.is_live(now);
-        let end = if live {
+        let start = self.start.with_timezone(&Local);
+        let end_at = if live { now } else { self.last };
+        let end = end_at.with_timezone(&Local);
+        let end_text = if live {
             "进行中".to_string()
+        } else if start.date_naive() == end.date_naive() {
+            end.format("%H:%M").to_string()
         } else {
-            self.last.with_timezone(&Local).format("%H:%M").to_string()
+            end.format("%m月%d日 %H:%M").to_string()
         };
-        let seconds = (if live { now } else { self.last })
+        let seconds = end_at
             .signed_duration_since(self.start)
             .num_seconds()
-            .max(0);
+            .max(0) as u64;
         format!(
-            "{} → {} ({:02}m{:02}s)",
-            self.start.with_timezone(&Local).format("%m月%d日 %H:%M"),
-            end,
-            seconds / 60,
-            seconds % 60
+            "{} → {} ({})",
+            start.format("%m月%d日 %H:%M"),
+            end_text,
+            format_duration(seconds)
         )
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 3_600 {
+        format!("{:02}m{:02}s", seconds / 60, seconds % 60)
+    } else if seconds < 86_400 {
+        format!("{}h{:02}m", seconds / 3_600, seconds % 3_600 / 60)
+    } else {
+        format!("{}d{:02}h", seconds / 86_400, seconds % 86_400 / 3_600)
     }
 }
 
@@ -313,12 +340,38 @@ fn user_text(content: Option<&Value>) -> Option<String> {
         _ => return None,
     };
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!text.is_empty()).then_some(text)
+    if let Some(summary) = slash_command_summary(&text) {
+        Some(summary)
+    } else {
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+fn slash_command_summary(text: &str) -> Option<String> {
+    let command = xml_tag(text, "command-name")?.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let args = xml_tag(text, "command-args").unwrap_or("").trim();
+    Some(if args.is_empty() {
+        format!("[{command}]")
+    } else {
+        format!("[{command}] {args}")
+    })
+}
+
+fn xml_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let opening = format!("<{tag}>");
+    let start = text.find(&opening)? + opening.len();
+    let closing = format!("</{tag}>");
+    let end = text[start..].find(&closing)? + start;
+    Some(&text[start..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use serde_json::json;
     use std::fs;
 
@@ -330,7 +383,7 @@ mod tests {
         fs::create_dir_all(&subagents).unwrap();
         let lines = [
             json!({"type":"user", "timestamp":"2026-11-25T06:00:00Z", "message":{
-                "role":"user", "content":" /implement-specs\n 实现选择器 "}}),
+                "role":"user", "content":"<command-message>implement-spec</command-message>\n<command-name>/implement-spec</command-name>\n<command-args>实现选择器</command-args>"}}),
             json!({"type":"assistant", "timestamp":"2026-11-25T06:00:10Z", "message":{
                 "id":"same", "role":"assistant", "usage":{"input_tokens":500,"output_tokens":100},
                 "content":[{"type":"tool_use","id":"spawn","name":"Agent","input":{}},{"type":"tool_use","id":"merge","name":"Bash","input":{"command":"git.exe merge topic"}}]}}),
@@ -356,13 +409,18 @@ mod tests {
         )
         .unwrap();
 
+        fs::write(project.join("empty.jsonl"), "").unwrap();
+
         let catalog = ProjectSessions::scan(&project).unwrap();
+        assert_eq!(catalog.sessions.len(), 2);
+        assert!(catalog.sessions[1].is_empty());
+        assert_eq!(catalog.sessions[1].status(Utc::now()), SessionStatus::Empty);
         let summary = &catalog.sessions[0];
         assert_eq!(summary.turns, 1);
         assert_eq!(summary.agents, 2);
         assert_eq!(summary.tokens, 1_100);
         assert_eq!(summary.dispatched, 1);
-        assert_eq!(summary.prompt, "/implement-specs 实现选择器");
+        assert_eq!(summary.prompt, "[/implement-spec] 实现选择器");
         assert!(summary.failed && summary.had_error);
         let mut scan = Scan::default();
         scan_file(&project.join("one.jsonl"), true, &mut scan);
@@ -379,5 +437,42 @@ mod tests {
         summary.compacted = false;
         assert_eq!(summary.status(Utc::now()), SessionStatus::Ok);
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn formats_cross_day_ranges_and_long_durations() {
+        assert_eq!(format_duration(18 * 60 + 40), "18m40s");
+        assert_eq!(format_duration(17 * 3_600 + 46 * 60), "17h46m");
+        assert_eq!(format_duration(5 * 86_400 + 58), "5d00h");
+        let start = Local.with_ymd_and_hms(2026, 11, 9, 17, 24, 0).unwrap();
+        let mut summary = SessionSummary {
+            id: "cross-day".into(),
+            start: start.with_timezone(&Utc),
+            last: Local
+                .with_ymd_and_hms(2026, 11, 10, 11, 11, 0)
+                .unwrap()
+                .with_timezone(&Utc),
+            turns: 1,
+            agents: 1,
+            tokens: 1,
+            dispatched: 0,
+            had_error: false,
+            failed: false,
+            compacted: false,
+            ended: true,
+            prompt: "-".into(),
+        };
+        assert_eq!(
+            summary.time_range(Utc::now()),
+            "11月09日 17:24 → 11月10日 11:11 (17h47m)"
+        );
+        summary.last = Local
+            .with_ymd_and_hms(2026, 11, 9, 17, 41, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            summary.time_range(Utc::now()),
+            "11月09日 17:24 → 17:41 (17m00s)"
+        );
     }
 }

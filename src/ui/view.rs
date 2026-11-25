@@ -4,15 +4,15 @@ use super::{
     sessions::{ProjectSessions, SessionStatus},
 };
 use crate::{analyzer::analyzer::AgentReport, format_tokens};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Cell, List, ListItem, ListState, Padding, Paragraph, Row,
-        Table, TableState, Wrap,
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph,
+        Row, Table, TableState, Wrap,
     },
 };
 
@@ -65,9 +65,55 @@ fn short_agent_id(agent_id: &str) -> String {
         .collect()
 }
 
+fn split_slash_prompt(prompt: &str) -> Option<(&str, &str)> {
+    let (command, description) = prompt.strip_prefix('[')?.split_once(']')?;
+    command
+        .starts_with('/')
+        .then_some((command, description.trim_start()))
+}
+
+fn prompt_spans(prompt: &str) -> Vec<Span<'static>> {
+    if let Some((command, description)) = split_slash_prompt(prompt) {
+        let mut spans = vec![Span::styled(
+            format!("[{command}]"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if !description.is_empty() {
+            spans.push(Span::styled(
+                format!(" {description}"),
+                Style::default().fg(Color::White),
+            ));
+        }
+        spans
+    } else {
+        vec![Span::styled(
+            prompt.to_string(),
+            Style::default().fg(Color::White),
+        )]
+    }
+}
+
+fn command_label(prompt: &str) -> &str {
+    if let Some((command, _)) = split_slash_prompt(prompt) {
+        command
+    } else {
+        prompt
+            .split_whitespace()
+            .next()
+            .filter(|word| word.starts_with('/'))
+            .unwrap_or("-")
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.selector_open {
         draw_session_selector(frame, app);
+        if app.quit_confirm_open {
+            let area = frame.area();
+            draw_quit_confirmation(frame, area);
+        }
         return;
     }
     let areas = Layout::default()
@@ -110,6 +156,55 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         )),
     ];
     frame.render_widget(Paragraph::new(footer).block(panel("", false)), areas[2]);
+    if app.quit_confirm_open {
+        let area = frame.area();
+        draw_quit_confirmation(frame, area);
+    }
+}
+
+fn draw_quit_confirmation(frame: &mut Frame, area: Rect) {
+    let width = 40.min(area.width);
+    let height = 7.min(area.height);
+    let modal = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    let lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            "确定要退出 spec-xray 吗？",
+            Style::default().fg(Color::White),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(
+                "[Enter / y]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" 确认退出"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "[Esc / n]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   取消返回"),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow))
+        .padding(Padding::horizontal(1))
+        .title("确认退出");
+    frame.render_widget(Clear, modal);
+    frame.render_widget(Paragraph::new(lines).block(block), modal);
 }
 
 fn draw_session_selector(frame: &mut Frame, app: &mut App) {
@@ -138,28 +233,25 @@ fn draw_session_selector(frame: &mut Frame, app: &mut App) {
             } else {
                 ""
             }),
-            Cell::from(format!("{} |", session.time_range(now))),
-            Cell::from(format!("{:>5}轮 |", session.turns)),
-            Cell::from(format!("{:>4} |", session.agents)),
+            Cell::from(session.time_range(now)),
+            Cell::from(format!("{:>5}轮", session.turns)),
+            Cell::from(format!("{:>4}", session.agents)),
             Cell::from(Span::styled(
-                format!("{:>6} |", format_tokens(session.tokens)),
+                format!("{:>7}", format_tokens(session.tokens)),
                 Style::default().fg(Color::Cyan),
             )),
-            Cell::from(Span::styled(
-                format!("{} |", status.label()),
-                session_status_style(status),
-            )),
-            Cell::from(session.prompt.as_str()),
+            Cell::from(Span::styled(status.label(), session_status_style(status))),
+            Cell::from(Line::from(prompt_spans(&session.prompt))),
         ])
     });
     let table = Table::new(
         rows,
         [
             Constraint::Length(2),
-            Constraint::Length(34),
-            Constraint::Length(10),
+            Constraint::Length(40),
+            Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Length(9),
-            Constraint::Length(10),
             Constraint::Length(9),
             Constraint::Min(8),
         ],
@@ -199,6 +291,7 @@ fn draw_session_selector(frame: &mut Frame, app: &mut App) {
             ("j/k", "Move"),
             ("PgUp/PgDn", "Page"),
             ("r", "Rescan"),
+            ("q", "Quit"),
         ]),
         Line::from(Span::styled(
             app.status.clone(),
@@ -231,14 +324,18 @@ fn draw_project_summary(frame: &mut Frame, catalog: Option<&ProjectSessions>, ar
         lines.push(Line::from(
             "Recent 10 sessions (newest → oldest):  ! failure  ~ warning",
         ));
-        let max = catalog
+        let recent: Vec<_> = catalog
             .sessions
             .iter()
+            .filter(|session| !session.is_empty())
             .take(10)
+            .collect();
+        let max = recent
+            .iter()
             .map(|session| session.tokens)
             .max()
             .unwrap_or(0);
-        for (index, session) in catalog.sessions.iter().take(10).enumerate() {
+        for session in recent {
             let filled = if max == 0 || session.tokens == 0 {
                 0
             } else {
@@ -253,18 +350,25 @@ fn draw_project_summary(frame: &mut Frame, catalog: Option<&ProjectSessions>, ar
                 Span::raw(" ")
             };
             lines.push(Line::from(vec![
-                Span::raw(format!("{:>2} ", index + 1)),
                 Span::styled("█".repeat(filled), Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    "░".repeat(20 - filled),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::raw(" ".repeat(20 - filled)),
                 Span::styled(
                     format!(" {:>7} ", format_tokens(session.tokens)),
                     Style::default().fg(Color::Cyan),
                 ),
+                Span::styled(
+                    format!("{} ", session.start.with_timezone(&Local).format("%m-%d")),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 marker,
-                Span::styled(format!(" {}", status.label()), session_status_style(status)),
+                Span::styled(
+                    format!(" {} ", status.label()),
+                    session_status_style(status),
+                ),
+                Span::styled(
+                    command_label(&session.prompt),
+                    Style::default().fg(Color::Cyan),
+                ),
             ]));
         }
         if count == 0 {
@@ -293,8 +397,14 @@ fn session_status_style(status: SessionStatus) -> Style {
         SessionStatus::Fail => Color::Red,
         SessionStatus::Warn => Color::Yellow,
         SessionStatus::Ok => Color::Green,
+        SessionStatus::Empty => Color::DarkGray,
     };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+    let style = Style::default().fg(color);
+    if status == SessionStatus::Empty {
+        style
+    } else {
+        style.add_modifier(Modifier::BOLD)
+    }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -881,14 +991,62 @@ mod tests {
         assert!(app.selector_open);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.sessions.as_ref().unwrap().sessions.len(), 2);
-        app.session_selected = 0;
+        app.session_selected = app
+            .sessions
+            .as_ref()
+            .unwrap()
+            .sessions
+            .iter()
+            .position(|session| session.id == "other")
+            .unwrap();
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(!app.selector_open);
         assert_eq!(app.report.session_id, "other");
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.quit_confirm_open && !app.quit);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = buffer_text(&terminal);
+        let compact: String = rendered
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(compact.contains("确认退出"), "{rendered}");
+        assert!(compact.contains("确定要退出spec-xray吗？"), "{rendered}");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.quit_confirm_open && !app.quit);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.quit && !app.quit_confirm_open);
         let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn slash_prompt_separates_badge_and_description() {
+        let spans = prompt_spans("[/implement-spec] 实现选择器");
+        assert_eq!(spans[0].content.as_ref(), "[/implement-spec]");
+        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(spans[1].content.as_ref(), " 实现选择器");
+        assert_eq!(spans[1].style.fg, Some(Color::White));
+        assert_eq!(
+            command_label("[/implement-spec] 实现选择器"),
+            "/implement-spec"
+        );
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub struct App {
     pub right_height: u16,
     pub live: bool,
     pub status: String,
+    pub quit_confirm_open: bool,
     pub quit: bool,
     watcher: Option<RecommendedWatcher>,
     events: Option<Receiver<notify::Result<notify::Event>>>,
@@ -120,6 +121,7 @@ impl App {
             right_height: 0,
             live: false,
             status: String::new(),
+            quit_confirm_open: false,
             quit: false,
             watcher: None,
             events: None,
@@ -252,6 +254,21 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if self.quit_confirm_open {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('q') => {
+                    self.quit_confirm_open = false;
+                    self.quit = true;
+                }
+                KeyCode::Esc | KeyCode::Char('n') => self.quit_confirm_open = false,
+                _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('q') {
+            self.quit_confirm_open = true;
+            return;
+        }
         if key.code == KeyCode::Char('s') {
             self.toggle_selector();
             return;
@@ -270,7 +287,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Esc => self.quit_confirm_open = true,
             KeyCode::Char('v') => {
                 self.mode = match self.mode {
                     ViewMode::Compact => ViewMode::Diagnostic,
