@@ -580,7 +580,7 @@ fn normalize_file_path(path: &str, cwd: Option<&str>) -> String {
     }
 }
 
-fn is_merge_command(command: &str) -> bool {
+pub(crate) fn is_merge_command(command: &str) -> bool {
     command.split(['&', '|', ';', '\n']).any(|segment| {
         let mut words = segment
             .split_whitespace()
@@ -599,7 +599,7 @@ fn is_merge_command(command: &str) -> bool {
 }
 
 // shortcut: 仅识别常见构建/测试命令，支持其他工具链时扩展此列表。
-fn is_build_or_test_command(command: &str) -> bool {
+pub(crate) fn is_build_or_test_command(command: &str) -> bool {
     command.split(['&', '|', ';', '\n']).any(|segment| {
         let mut words = segment
             .split_whitespace()

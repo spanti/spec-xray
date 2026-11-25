@@ -1,5 +1,6 @@
 mod app;
 mod live;
+mod sessions;
 mod view;
 
 use anyhow::Result;

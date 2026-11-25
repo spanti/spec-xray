@@ -1,8 +1,10 @@
 use super::{
     app::{App, Focus, ViewMode, ViewTab},
     live::LiveStatus,
+    sessions::{ProjectSessions, SessionStatus, format_tokens},
 };
 use crate::analyzer::analyzer::AgentReport;
+use chrono::Utc;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -21,6 +23,10 @@ fn context_fill(tokens: u64) -> usize {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    if app.selector_open {
+        draw_session_selector(frame, app);
+        return;
+    }
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -45,7 +51,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let footer = vec![
         Line::from(
-            "q/Esc Quit  v View  h/l Focus  j/k/↑/↓ Move/Scroll  Tab/1-4 Tabs  PgUp/PgDn  r Full reload  y Copy",
+            "q/Esc Quit  s Sessions  v View  h/l Focus  j/k/↑/↓ Move/Scroll  Tab/1-4 Tabs  PgUp/PgDn  r Reload  y Copy",
         ),
         Line::from(Span::styled(
             app.status.clone(),
@@ -56,6 +62,185 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         areas[2],
     );
+}
+
+fn draw_session_selector(frame: &mut Frame, app: &mut App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(15),
+            Constraint::Min(1),
+            Constraint::Length(4),
+        ])
+        .split(frame.area());
+    draw_project_summary(frame, app.sessions.as_ref(), areas[0]);
+    app.selector_height = areas[1].height.saturating_sub(3);
+
+    let now = Utc::now();
+    let empty = Vec::new();
+    let sessions = app
+        .sessions
+        .as_ref()
+        .map_or(&empty, |catalog| &catalog.sessions);
+    let rows = sessions.iter().map(|session| {
+        let status = session.status(now);
+        Row::new(vec![
+            Cell::from(if session.id == app.report.session_id {
+                "●"
+            } else {
+                ""
+            }),
+            Cell::from(format!("{} |", session.time_range(now))),
+            Cell::from(format!("{:>5}轮 |", session.turns)),
+            Cell::from(format!("{:>4} |", session.agents)),
+            Cell::from(format!("{:>6} |", format_tokens(session.tokens))),
+            Cell::from(Span::styled(
+                format!("{} |", status.label()),
+                session_status_style(status),
+            )),
+            Cell::from(session.prompt.as_str()),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(2),
+            Constraint::Length(34),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Min(8),
+        ],
+    )
+    .header(
+        Row::new([
+            "",
+            "时间段",
+            "轮数",
+            "Agents",
+            "Token",
+            "状态",
+            "首条 Prompt 摘要",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .column_spacing(1)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Sessions — newest first"),
+    )
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("▶ ");
+    let selected = (!sessions.is_empty()).then_some(app.session_selected);
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, areas[1], &mut state);
+
+    let footer = vec![
+        Line::from("s/Esc Back  Enter Load session  j/k/↑/↓ Move  PgUp/PgDn Page  r Rescan"),
+        Line::from(Span::styled(
+            app.status.clone(),
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
+        areas[2],
+    );
+}
+
+fn draw_project_summary(frame: &mut Frame, catalog: Option<&ProjectSessions>, area: Rect) {
+    let now = Utc::now();
+    let mut lines = Vec::new();
+    if let Some(catalog) = catalog {
+        let count = catalog.sessions.len();
+        let total = catalog.total_tokens();
+        let average = if count == 0 { 0 } else { total / count as u64 };
+        lines.push(Line::from(format!(
+            "Sessions: {count}  |  Total: {}  |  Avg: {}  |  Subagents: {}",
+            format_tokens(total),
+            format_tokens(average),
+            catalog.dispatched()
+        )));
+        lines.push(Line::from(format!(
+            "Build/tool failures: {} ({:.1}%)  |  Compactions: {} ({:.1}%)",
+            catalog.failed_count(),
+            percentage(catalog.failed_count(), count),
+            catalog.compacted_count(),
+            percentage(catalog.compacted_count(), count)
+        )));
+        lines.push(Line::from(
+            "Recent 10 sessions (newest → oldest):  ! failure  ~ warning",
+        ));
+        let max = catalog
+            .sessions
+            .iter()
+            .take(10)
+            .map(|session| session.tokens)
+            .max()
+            .unwrap_or(0);
+        for (index, session) in catalog.sessions.iter().take(10).enumerate() {
+            let filled = if max == 0 || session.tokens == 0 {
+                0
+            } else {
+                ((session.tokens as f64 * 20.0 / max as f64).round() as usize).max(1)
+            };
+            let status = session.status(now);
+            let marker = if session.failed {
+                Span::styled("!", Style::default().fg(Color::Red))
+            } else if session.had_error || session.compacted {
+                Span::styled("~", Style::default().fg(Color::Yellow))
+            } else {
+                Span::raw(" ")
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:>2} ", index + 1)),
+                Span::styled(
+                    format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled)),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(format!(" {:>7} ", format_tokens(session.tokens))),
+                marker,
+                Span::styled(format!(" {}", status.label()), session_status_style(status)),
+            ]));
+        }
+        if count == 0 {
+            lines.push(muted("No sessions found."));
+        }
+    } else {
+        lines.push(muted("No project metadata. Press r to rescan."));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Project overview — all historical sessions"),
+        ),
+        area,
+    );
+}
+
+fn percentage(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
+    }
+}
+
+fn session_status_style(status: SessionStatus) -> Style {
+    let color = match status {
+        SessionStatus::Live => Color::Cyan,
+        SessionStatus::Fail => Color::Red,
+        SessionStatus::Warn => Color::Yellow,
+        SessionStatus::Ok => Color::Green,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -542,6 +727,7 @@ mod tests {
             }], "usage": {"input_tokens": 150_000}}
         });
         fs::write(directory.join("session.jsonl"), format!("{line}\n")).unwrap();
+        fs::write(directory.join("other.jsonl"), "").unwrap();
         directory
     }
 
@@ -562,6 +748,21 @@ mod tests {
         app.mode = ViewMode::Compact;
         terminal.backend_mut().resize(80, 20);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.selector_open);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.sessions.as_ref().unwrap().sessions.len(), 2);
+        app.session_selected = 0;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.selector_open);
+        assert_eq!(app.report.session_id, "other");
         let _ = fs::remove_dir_all(project);
     }
 

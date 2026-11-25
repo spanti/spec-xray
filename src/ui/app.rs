@@ -1,4 +1,7 @@
-use super::live::{LiveSnapshot, LiveStatus, LiveTracker, TreeRow};
+use super::{
+    live::{LiveSnapshot, LiveStatus, LiveTracker, TreeRow},
+    sessions::ProjectSessions,
+};
 use crate::analyzer::analyzer::{AgentReport, SessionReport, list_sessions};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -47,6 +50,10 @@ pub struct App {
     threshold: u64,
     tracker: LiveTracker,
     pub report: SessionReport,
+    pub sessions: Option<ProjectSessions>,
+    pub selector_open: bool,
+    pub session_selected: usize,
+    pub selector_height: u16,
     pub markdown: String,
     pub rows: Vec<TreeRow>,
     pub selected: usize,
@@ -85,6 +92,10 @@ impl App {
             threshold,
             tracker,
             report: snapshot.report,
+            sessions: None,
+            selector_open: false,
+            session_selected: 0,
+            selector_height: 10,
             markdown: snapshot.markdown,
             rows: snapshot.rows,
             selected: 0,
@@ -226,6 +237,23 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if key.code == KeyCode::Char('s') {
+            self.toggle_selector();
+            return;
+        }
+        if self.selector_open {
+            match key.code {
+                KeyCode::Esc => self.selector_open = false,
+                KeyCode::Char('r') => self.rescan_sessions(),
+                KeyCode::Enter => self.load_selected_session(),
+                KeyCode::Char('j') | KeyCode::Down => self.move_session(1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_session(-1),
+                KeyCode::PageDown => self.move_session(self.selector_height.max(1) as i32),
+                KeyCode::PageUp => self.move_session(-(self.selector_height.max(1) as i32)),
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('v') => {
@@ -267,6 +295,76 @@ impl App {
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('y') => self.copy_report(),
             _ => {}
+        }
+    }
+
+    fn toggle_selector(&mut self) {
+        if self.selector_open {
+            self.selector_open = false;
+            return;
+        }
+        if self.sessions.is_none() {
+            self.rescan_sessions();
+        } else {
+            self.select_current_session();
+        }
+        self.selector_open = true;
+    }
+
+    fn rescan_sessions(&mut self) {
+        match ProjectSessions::scan(&self.project_dir) {
+            Ok(sessions) => {
+                self.status = format!("Scanned {} sessions.", sessions.sessions.len());
+                self.sessions = Some(sessions);
+                self.select_current_session();
+            }
+            Err(error) => self.status = format!("Session scan failed: {error:#}"),
+        }
+    }
+
+    fn select_current_session(&mut self) {
+        self.session_selected = self
+            .sessions
+            .as_ref()
+            .and_then(|sessions| {
+                sessions
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == self.report.session_id)
+            })
+            .unwrap_or(0);
+    }
+
+    fn move_session(&mut self, amount: i32) {
+        let Some(sessions) = &self.sessions else {
+            return;
+        };
+        if sessions.sessions.is_empty() {
+            return;
+        }
+        self.session_selected = (self.session_selected as i32 + amount)
+            .clamp(0, sessions.sessions.len() as i32 - 1) as usize;
+    }
+
+    fn load_selected_session(&mut self) {
+        let Some(id) = self.sessions.as_ref().and_then(|sessions| {
+            sessions
+                .sessions
+                .get(self.session_selected)
+                .map(|session| session.id.clone())
+        }) else {
+            return;
+        };
+        match LiveTracker::load(&self.project_dir, &id, self.threshold) {
+            Ok(tracker) => {
+                self.tracker = tracker;
+                self.apply_snapshot();
+                self.selected = 0;
+                self.right_scroll = 0;
+                self.selector_open = false;
+                self.status = format!("Loaded session {id}.");
+            }
+            Err(error) => self.status = format!("Session load failed: {error:#}"),
         }
     }
 
