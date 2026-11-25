@@ -451,7 +451,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), sections[0]);
 
-    let lines = detail_lines(app);
+    let lines = detail_lines(app, sections[1].width as usize);
     app.right_len = lines.len();
     app.right_height = sections[1].height;
     frame.render_widget(
@@ -462,17 +462,27 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn detail_lines(app: &App) -> Vec<Line<'static>> {
+fn detail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     match app.tab {
         ViewTab::Radar => app
             .selected_agent()
             .map(radar_lines)
             .unwrap_or_else(|| empty("No agent selected.")),
         ViewTab::Merge => merge_lines(app),
-        ViewTab::Timeline => app
-            .selected_agent()
-            .map(timeline_lines)
-            .unwrap_or_else(|| empty("No agent selected.")),
+        ViewTab::Timeline => {
+            let track_width = width.saturating_sub(52).clamp(10, 60);
+            let mut lines: Vec<_> = crate::gantt::render_gantt(&app.topology, track_width)
+                .lines()
+                .map(|line| Line::from(line.to_string()))
+                .collect();
+            lines.push(Line::default());
+            lines.extend(
+                app.selected_agent()
+                    .map(timeline_lines)
+                    .unwrap_or_else(|| empty("No agent selected.")),
+            );
+            lines
+        }
         ViewTab::Report => app
             .markdown
             .lines()

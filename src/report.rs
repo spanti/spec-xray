@@ -1,4 +1,4 @@
-use crate::{analyzer::analyzer::SessionReport, parser::tree};
+use crate::{analyzer::analyzer::SessionReport, gantt::render_gantt, parser::tree};
 use indoc::indoc;
 
 pub fn render_markdown(report: &SessionReport) -> String {
@@ -41,6 +41,15 @@ pub fn render_markdown_with_topology(
 
             "#},
                 ascii_tree = ascii_tree,
+            )
+        })
+        .unwrap_or_default();
+
+    let gantt = cached_topology
+        .map(|topology| {
+            format!(
+                "## 0.1 并行甘特图与编排空窗\n```text\n{}\n```\n\n",
+                render_gantt(topology, 40)
             )
         })
         .unwrap_or_default();
@@ -226,5 +235,5 @@ pub fn render_markdown_with_topology(
         )
     };
 
-    format!("{header}{topology}{overview}{clashes}{bloat}{failures}")
+    format!("{header}{topology}{gantt}{overview}{clashes}{bloat}{failures}")
 }

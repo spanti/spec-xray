@@ -4,7 +4,9 @@ use crate::{
     },
     parser::{
         schema::RawLine,
-        tree::{AgentLinkMeta, SpawnCall, TopologyNode, build_topology_from_links},
+        tree::{
+            AgentLinkMeta, SessionTopology, SpawnCall, TopologyNode, build_topology_from_links,
+        },
     },
     report::render_markdown_with_topology,
 };
@@ -64,6 +66,7 @@ pub struct TreeRow {
 
 pub struct LiveSnapshot {
     pub report: SessionReport,
+    pub topology: SessionTopology,
     pub markdown: String,
     pub rows: Vec<TreeRow>,
 }
@@ -249,6 +252,7 @@ impl LiveTracker {
         let markdown = render_markdown_with_topology(&report, Some(&topology));
         LiveSnapshot {
             report,
+            topology,
             markdown,
             rows,
         }

@@ -1,4 +1,4 @@
-use crate::analyzer::analyzer::AgentReport;
+use crate::analyzer::analyzer::{AgentReport, extract_tool_target, is_merge_command};
 use crate::parser::schema::RawLine;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -19,6 +19,13 @@ pub struct SpawnCall {
     pub resolved_child_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MergeEvent {
+    pub agent_id: String,
+    pub action: String,
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
 /// 拓扑树节点（可用于 CLI 树状输出，也可直接复用于后续 Ratatui 左侧树面板）
 #[derive(Debug, Clone)]
 pub struct TopologyNode {
@@ -37,6 +44,8 @@ pub struct TopologyNode {
 pub struct SessionTopology {
     pub root: TopologyNode,
     pub orphans: Vec<TopologyNode>,
+    pub first_dispatch: Option<DateTime<Utc>>,
+    pub merge_events: Vec<MergeEvent>,
 }
 
 /// 扫描主会话与所有 subagents 日志，重建完整的父子调用拓扑树。
@@ -88,6 +97,15 @@ pub fn build_topology_from_links(
         }
         all_spawns.extend(meta.spawns.iter().cloned());
     }
+    let first_dispatch = all_spawns
+        .iter()
+        .filter(|spawn| spawn.parent_agent_id == "main")
+        .filter_map(|spawn| spawn.spawned_at)
+        .min();
+    let merge_events = links
+        .iter()
+        .flat_map(|meta| meta.merge_events.iter().cloned())
+        .collect();
 
     let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut attached_children: HashSet<String> = HashSet::new();
@@ -140,7 +158,12 @@ pub fn build_topology_from_links(
             ));
         }
     }
-    SessionTopology { root, orphans }
+    SessionTopology {
+        root,
+        orphans,
+        first_dispatch,
+        merge_events,
+    }
 }
 
 fn build_node(
@@ -197,6 +220,7 @@ pub struct AgentLinkMeta {
     pub last_ts: Option<DateTime<Utc>>,
     pub parent_tool_use_id: Option<String>,
     pub spawns: Vec<SpawnCall>,
+    pub merge_events: Vec<MergeEvent>,
     pending_spawns: HashMap<String, usize>,
 }
 
@@ -208,6 +232,7 @@ impl AgentLinkMeta {
             last_ts: None,
             parent_tool_use_id: None,
             spawns: Vec::new(),
+            merge_events: Vec::new(),
             pending_spawns: HashMap::new(),
         }
     }
@@ -260,6 +285,17 @@ impl AgentLinkMeta {
                             description,
                             spawned_at: timestamp,
                             resolved_child_id: None,
+                        });
+                    }
+                }
+                "tool_use" if block.get("name").and_then(|v| v.as_str()) == Some("Bash") => {
+                    let (target, _) =
+                        extract_tool_target("Bash", block.get("input"), raw.cwd.as_deref());
+                    if target.as_deref().is_some_and(is_merge_command) {
+                        self.merge_events.push(MergeEvent {
+                            agent_id: self.agent_id.clone(),
+                            action: target.unwrap_or_default(),
+                            timestamp,
                         });
                     }
                 }

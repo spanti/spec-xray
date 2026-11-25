@@ -10,6 +10,7 @@
 - 找出多个 Agent 修改同一文件的碰撞，并记录合并后的首次构建/测试结果。
 - 使用独立文件偏移和半行缓冲增量刷新 TUI，自动发现新的 `subagents/*.jsonl`。
 - 提供项目级 Session 统计、最近 10 次消耗趋势和交互式 Session 选择器。
+- 在 CLI 报告和 TUI Timeline 中展示并行甘特泳道、峰值并行、长尾瓶颈及超过 30 秒的编排 Gap。
 
 ## 构建与安装
 
@@ -138,6 +139,7 @@ Session 徽标：
 src/
 ├── main.rs                 # CLI 参数与报告输出
 ├── analyzer/analyzer.rs    # Token、Compaction、失败与 Merge 分析
+├── gantt.rs                # 共享并行泳道、长尾与编排 Gap 渲染
 ├── parser/
 │   ├── schema.rs           # 宽容的 JSONL 数据结构
 │   └── tree.rs             # Main/Subagent 拓扑重建

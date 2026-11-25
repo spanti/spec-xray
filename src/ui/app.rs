@@ -2,7 +2,10 @@ use super::{
     live::{LiveSnapshot, LiveStatus, LiveTracker, TreeRow},
     sessions::ProjectSessions,
 };
-use crate::analyzer::analyzer::{AgentReport, SessionReport, list_sessions};
+use crate::{
+    analyzer::analyzer::{AgentReport, SessionReport, list_sessions},
+    parser::tree::SessionTopology,
+};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -50,6 +53,7 @@ pub struct App {
     threshold: u64,
     tracker: LiveTracker,
     pub report: SessionReport,
+    pub topology: SessionTopology,
     pub sessions: Option<ProjectSessions>,
     pub selector_open: bool,
     pub session_selected: usize,
@@ -92,6 +96,7 @@ impl App {
             threshold,
             tracker,
             report: snapshot.report,
+            topology: snapshot.topology,
             sessions: None,
             selector_open: false,
             session_selected: 0,
@@ -209,10 +214,12 @@ impl App {
         let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
         let LiveSnapshot {
             report,
+            topology,
             markdown,
             rows,
         } = self.tracker.snapshot();
         self.report = report;
+        self.topology = topology;
         self.markdown = markdown;
         self.rows = rows;
         self.selected = selected_id

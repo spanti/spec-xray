@@ -594,7 +594,7 @@ pub(crate) fn is_merge_command(command: &str) -> bool {
             .unwrap_or(executable)
             .trim_end_matches(".exe")
             .eq_ignore_ascii_case("git")
-            && words.next() == Some("merge")
+            && matches!(words.next(), Some("merge" | "cherry-pick" | "rebase"))
     })
 }
 
