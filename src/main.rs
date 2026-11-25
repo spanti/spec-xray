@@ -20,6 +20,10 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 10_000)]
     threshold: u64,
 
+    /// 将诊断报告写入系统剪贴板（兼容旧版；不写入输出文件）
+    #[arg(long, global = true)]
+    copy: bool,
+
     /// 诊断报告输出路径（默认写入当前目录的 output.log，不重复输出到终端）
     #[arg(long, global = true, default_value = "output.log")]
     output: PathBuf,
@@ -61,11 +65,11 @@ fn main() -> Result<()> {
             let sessions = analyzer::list_sessions(&proj_dir)?;
             let (latest_id, _) = sessions.first().context("当前项目下没有任何会话日志")?;
             let rep = analyzer::analyze_session(&proj_dir, latest_id, cli.threshold)?;
-            emit_report(&report::render_markdown(&rep), &cli.output)?;
+            emit_report(&report::render_markdown(&rep), &cli.output, cli.copy)?;
         }
         Commands::Inspect { session_id } => {
             let rep = analyzer::analyze_session(&proj_dir, &session_id, cli.threshold)?;
-            emit_report(&report::render_markdown(&rep), &cli.output)?;
+            emit_report(&report::render_markdown(&rep), &cli.output, cli.copy)?;
         }
         Commands::Tui { session_id } => {
             spec_xray::ui::run(&proj_dir, session_id.as_deref(), cli.threshold)?;
@@ -75,7 +79,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn emit_report(markdown: &str, output: &Path) -> Result<()> {
+fn emit_report(markdown: &str, output: &Path, to_clipboard: bool) -> Result<()> {
+    if to_clipboard {
+        let mut clipboard = arboard::Clipboard::new().context("初始化系统剪贴板失败")?;
+        clipboard
+            .set_text(markdown.to_owned())
+            .context("写入诊断报告到剪贴板失败")?;
+        eprintln!("诊断报告已复制到系统剪贴板。");
+        return Ok(());
+    }
     fs::write(output, markdown)
         .with_context(|| format!("写入诊断报告到 {} 失败", output.display()))?;
 

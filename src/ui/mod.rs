@@ -1,19 +1,22 @@
 mod app;
+mod live;
 mod view;
 
 use anyhow::Result;
 use app::App;
 use crossterm::{
+    cursor::Show,
     event::{self, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::{io, path::Path, time::Duration};
+use std::{io, panic, path::Path, time::Duration};
 
 pub fn run(project_dir: &Path, session_id: Option<&str>, threshold: u64) -> Result<()> {
     let mut app = App::new(project_dir, session_id, threshold)?;
     app.watch()?;
+    install_panic_hook();
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     enable_raw_mode()?;
@@ -31,6 +34,15 @@ pub fn run(project_dir: &Path, session_id: Option<&str>, threshold: u64) -> Resu
     leave_result?;
     cursor_result?;
     Ok(())
+}
+
+fn install_panic_hook() {
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        previous(info);
+    }));
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {

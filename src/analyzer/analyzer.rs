@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompactionReport {
     /// 压缩发生前已完成的 usage 轮次数
     pub turn: usize,
@@ -14,7 +14,7 @@ pub struct CompactionReport {
     pub after_tokens: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolAction {
     pub turn: usize,
     pub tool: String,
@@ -23,7 +23,7 @@ pub struct ToolAction {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MergeAudit {
     pub agent_id: String,
     pub action: String,
@@ -32,7 +32,7 @@ pub struct MergeAudit {
     pub suspect_files: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AgentReport {
     pub agent_id: String,
     /// 从主会话 Task/Agent 调用提取的任务描述（如 Ticket 标题）
@@ -42,6 +42,8 @@ pub struct AgentReport {
     pub turns: usize,
     pub startup_cache_tokens: u64,
     pub peak_context_tokens: u64,
+    /// 最近一个有效响应轮次的上下文占用
+    pub current_context_tokens: u64,
     pub total_tokens: u64,
     pub compactions: Vec<CompactionReport>,
     /// 工具名 -> 累计触发的上下文增量估算
@@ -163,6 +165,14 @@ pub fn analyze_session(
         }
     }
 
+    Ok(build_session_report(proj_dir, session_id, agents))
+}
+
+pub(crate) fn build_session_report(
+    proj_dir: &Path,
+    session_id: &str,
+    mut agents: Vec<AgentReport>,
+) -> SessionReport {
     let mut file_editors: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for agent in &agents {
         let display_name = match &agent.task_desc {
@@ -187,13 +197,13 @@ pub fn analyze_session(
         .flat_map(|agent| std::mem::take(&mut agent.merge_audits))
         .collect();
 
-    Ok(SessionReport {
+    SessionReport {
         project_dir: proj_dir.to_path_buf(),
         session_id: session_id.to_string(),
         agents,
         file_clashes,
         merge_audits,
-    })
+    }
 }
 
 fn analyze_single_jsonl(
@@ -204,37 +214,58 @@ fn analyze_single_jsonl(
 ) -> Result<AgentReport> {
     let file = File::open(path).with_context(|| format!("打开日志失败: {}", path.display()))?;
     let reader = BufReader::new(file);
-
-    let mut report = AgentReport {
-        agent_id: agent_id.to_string(),
-        is_main,
-        ..Default::default()
-    };
-
-    let mut usage_indices: HashMap<String, usize> = HashMap::new();
-    let mut usage_records: Vec<(Usage, Vec<ToolInvocation>)> = Vec::new();
-    let mut pending_tools: HashMap<String, ToolInvocation> = HashMap::new();
-    let mut tool_errors: HashMap<String, String> = HashMap::new();
-    let mut last_tools: Vec<ToolInvocation> = Vec::new();
-    let mut pending_edits: HashSet<String> = HashSet::new();
-    let mut last_failed_edits: HashSet<String> = HashSet::new();
-    let mut current_fail_streak: usize = 0;
-
+    let mut analyzer = IncrementalAnalyzer::new(agent_id, is_main, heavy_threshold);
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        if line.trim().is_empty() {
-            continue;
+        if let Ok(raw) = serde_json::from_str::<RawLine>(&line) {
+            analyzer.ingest(&raw);
         }
-        let Ok(raw) = serde_json::from_str::<RawLine>(&line) else {
-            continue;
-        };
+    }
+    Ok(analyzer.finish())
+}
 
+/// 可逐行喂入的分析内核；TUI 只追加新行，CLI 仍可从完整文件构建。
+pub(crate) struct IncrementalAnalyzer {
+    report: AgentReport,
+    heavy_threshold: u64,
+    usage_indices: HashMap<String, usize>,
+    usage_records: Vec<(Usage, Vec<ToolInvocation>)>,
+    pending_tools: HashMap<String, ToolInvocation>,
+    tool_errors: HashMap<String, String>,
+    last_tools: Vec<ToolInvocation>,
+    pending_edits: HashSet<String>,
+    last_failed_edits: HashSet<String>,
+    current_fail_streak: usize,
+}
+
+impl IncrementalAnalyzer {
+    pub(crate) fn new(agent_id: &str, is_main: bool, heavy_threshold: u64) -> Self {
+        Self {
+            report: AgentReport {
+                agent_id: agent_id.to_string(),
+                is_main,
+                ..Default::default()
+            },
+            heavy_threshold,
+            usage_indices: HashMap::new(),
+            usage_records: Vec::new(),
+            pending_tools: HashMap::new(),
+            tool_errors: HashMap::new(),
+            last_tools: Vec::new(),
+            pending_edits: HashSet::new(),
+            last_failed_edits: HashSet::new(),
+            current_fail_streak: 0,
+        }
+    }
+
+    pub(crate) fn ingest(&mut self, raw: &RawLine) {
+        let report = &mut self.report;
         if raw.event_type.as_deref() == Some("system")
             && raw.subtype.as_deref() == Some("compact_boundary")
             && let Some(metadata) = &raw.compact_metadata
         {
             report.compactions.push(CompactionReport {
-                turn: usage_records.len(),
+                turn: self.usage_records.len(),
                 before_tokens: metadata.pre_tokens,
                 after_tokens: metadata.post_tokens,
             });
@@ -247,29 +278,28 @@ fn analyze_single_jsonl(
         }
 
         let Some(msg) = raw.message.as_ref() else {
-            continue;
+            return;
         };
-
         if let Some(usage) = msg.usage {
             let dedup_key = msg.id.as_deref().or(raw.uuid.as_deref());
-            let existing = dedup_key.and_then(|key| usage_indices.get(key).copied());
+            let existing = dedup_key.and_then(|key| self.usage_indices.get(key).copied());
             if let Some(index) = existing {
-                usage_records[index].0 = usage;
+                self.usage_records[index].0 = usage;
             } else {
                 if let Some(key) = dedup_key {
-                    usage_indices.insert(key.to_string(), usage_records.len());
+                    self.usage_indices
+                        .insert(key.to_string(), self.usage_records.len());
                 }
-                usage_records.push((usage, std::mem::take(&mut last_tools)));
+                self.usage_records
+                    .push((usage, std::mem::take(&mut self.last_tools)));
             }
         }
 
         let Some(Value::Array(blocks)) = msg.content.as_ref() else {
-            continue;
+            return;
         };
-
         for block in blocks {
-            let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match btype {
+            match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
                 "tool_use" => {
                     let id = block
                         .get("id")
@@ -281,10 +311,8 @@ fn analyze_single_jsonl(
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown")
                         .to_string();
-                    let input = block.get("input");
-
                     let (target, has_line_limit) =
-                        extract_tool_target(&name, input, raw.cwd.as_deref());
+                        extract_tool_target(&name, block.get("input"), raw.cwd.as_deref());
                     let inv = ToolInvocation {
                         id: id.clone(),
                         name,
@@ -292,9 +320,9 @@ fn analyze_single_jsonl(
                         has_line_limit,
                     };
                     if !id.is_empty() {
-                        pending_tools.insert(id, inv.clone());
+                        self.pending_tools.insert(id, inv.clone());
                     }
-                    last_tools.push(inv);
+                    self.last_tools.push(inv);
                 }
                 "tool_result" => {
                     let tool_use_id = block
@@ -305,10 +333,10 @@ fn analyze_single_jsonl(
                         .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    if let Some(inv) = pending_tools.remove(tool_use_id) {
+                    if let Some(inv) = self.pending_tools.remove(tool_use_id) {
                         let content = block.get("content");
                         if is_error {
-                            tool_errors
+                            self.tool_errors
                                 .insert(tool_use_id.to_string(), extract_result_snippet(content));
                         }
                         if !is_error
@@ -319,7 +347,7 @@ fn analyze_single_jsonl(
                                 report.edited_files.keys().cloned().collect();
                             suspect_files.sort();
                             report.merge_audits.push(MergeAudit {
-                                agent_id: agent_id.to_string(),
+                                agent_id: report.agent_id.clone(),
                                 action: inv.target.clone().unwrap_or_else(|| "git merge".into()),
                                 build_success: None,
                                 build_error: None,
@@ -343,22 +371,25 @@ fn analyze_single_jsonl(
                             if inv.name == "Bash" {
                                 let cmd = inv.target.unwrap_or_else(|| "bash".into());
                                 if is_build_or_test_command(&cmd) {
-                                    if pending_edits.is_empty() {
-                                        current_fail_streak = 0;
-                                        last_failed_edits.clear();
+                                    if self.pending_edits.is_empty() {
+                                        self.current_fail_streak = 0;
+                                        self.last_failed_edits.clear();
                                     } else {
-                                        if pending_edits
+                                        if self
+                                            .pending_edits
                                             .iter()
-                                            .any(|path| last_failed_edits.contains(path))
+                                            .any(|path| self.last_failed_edits.contains(path))
                                         {
-                                            current_fail_streak += 1;
+                                            self.current_fail_streak += 1;
                                         } else {
-                                            current_fail_streak = 1;
+                                            self.current_fail_streak = 1;
                                         }
-                                        last_failed_edits = std::mem::take(&mut pending_edits);
+                                        self.last_failed_edits =
+                                            std::mem::take(&mut self.pending_edits);
                                     }
-                                    report.max_consecutive_failures =
-                                        report.max_consecutive_failures.max(current_fail_streak);
+                                    report.max_consecutive_failures = report
+                                        .max_consecutive_failures
+                                        .max(self.current_fail_streak);
                                     let snippet = extract_result_snippet(content);
                                     let cmd =
                                         cmd.lines().next().unwrap_or("").chars().take(72).collect();
@@ -379,15 +410,15 @@ fn analyze_single_jsonl(
                                     report
                                         .edited_files
                                         .insert(path.clone(), report.branch.clone());
-                                    pending_edits.insert(path);
+                                    self.pending_edits.insert(path);
                                 }
                             }
                             "Bash"
                                 if inv.target.as_deref().is_some_and(is_build_or_test_command) =>
                             {
-                                current_fail_streak = 0;
-                                pending_edits.clear();
-                                last_failed_edits.clear();
+                                self.current_fail_streak = 0;
+                                self.pending_edits.clear();
+                                self.last_failed_edits.clear();
                             }
                             "Task" | "Agent" => {
                                 if let (Some(desc), Some(sub_id)) =
@@ -405,54 +436,74 @@ fn analyze_single_jsonl(
         }
     }
 
-    let mut prev_context_size = 0;
-    for (usage, tools) in usage_records {
-        report.turns += 1;
-        let ctx = usage.context_size();
-        let mut action_delta = 0;
-        if report.turns == 1 {
-            report.startup_cache_tokens = usage.cache_creation_input_tokens;
-        } else if ctx > prev_context_size && !tools.is_empty() {
-            let delta = ctx - prev_context_size;
-            action_delta = delta / (tools.len() as u64);
-            for tool in &tools {
-                *report
-                    .tool_token_delta
-                    .entry(tool.name.clone())
-                    .or_default() += action_delta;
-                if action_delta >= heavy_threshold {
-                    let label =
-                        format!("{} ({})", tool.name, tool.target.as_deref().unwrap_or("-"));
-                    report.heavy_ops.push((label, action_delta));
+    pub(crate) fn refresh(&mut self) {
+        let report = &mut self.report;
+        report.turns = 0;
+        report.startup_cache_tokens = 0;
+        report.peak_context_tokens = 0;
+        report.current_context_tokens = 0;
+        report.total_tokens = 0;
+        report.tool_token_delta.clear();
+        report.heavy_ops.clear();
+        report.actions.clear();
+
+        let mut prev_context_size = 0;
+        for (usage, tools) in &self.usage_records {
+            report.turns += 1;
+            let ctx = usage.context_size();
+            let mut action_delta = 0;
+            if report.turns == 1 {
+                report.startup_cache_tokens = usage.cache_creation_input_tokens;
+            } else if ctx > prev_context_size && !tools.is_empty() {
+                let delta = ctx - prev_context_size;
+                action_delta = delta / (tools.len() as u64);
+                for tool in tools {
+                    *report
+                        .tool_token_delta
+                        .entry(tool.name.clone())
+                        .or_default() += action_delta;
+                    if action_delta >= self.heavy_threshold {
+                        let label =
+                            format!("{} ({})", tool.name, tool.target.as_deref().unwrap_or("-"));
+                        report.heavy_ops.push((label, action_delta));
+                    }
                 }
             }
+            report.actions.extend(tools.iter().map(|tool| ToolAction {
+                turn: report.turns,
+                tool: tool.name.clone(),
+                target: tool.target.clone(),
+                delta: action_delta,
+                error: self.tool_errors.get(&tool.id).cloned(),
+            }));
+            report.peak_context_tokens = report.peak_context_tokens.max(ctx);
+            report.current_context_tokens = ctx;
+            report.total_tokens += usage.total();
+            prev_context_size = ctx;
         }
-        report.actions.extend(tools.iter().map(|tool| ToolAction {
-            turn: report.turns,
-            tool: tool.name.clone(),
-            target: tool.target.clone(),
-            delta: action_delta,
-            error: tool_errors.get(&tool.id).cloned(),
-        }));
-        report.peak_context_tokens = report.peak_context_tokens.max(ctx);
-        report.total_tokens += usage.total();
-        prev_context_size = ctx;
+        report
+            .actions
+            .extend(self.last_tools.iter().map(|tool| ToolAction {
+                turn: report.turns + 1,
+                tool: tool.name.clone(),
+                target: tool.target.clone(),
+                delta: 0,
+                error: self.tool_errors.get(&tool.id).cloned(),
+            }));
+        report.heavy_ops.sort_by(|a, b| b.1.cmp(&a.1));
     }
-    report
-        .actions
-        .extend(last_tools.iter().map(|tool| ToolAction {
-            turn: report.turns + 1,
-            tool: tool.name.clone(),
-            target: tool.target.clone(),
-            delta: 0,
-            error: tool_errors.get(&tool.id).cloned(),
-        }));
 
-    report.heavy_ops.sort_by(|a, b| b.1.cmp(&a.1));
-    Ok(report)
+    pub(crate) fn report(&self) -> &AgentReport {
+        &self.report
+    }
+
+    fn finish(mut self) -> AgentReport {
+        self.refresh();
+        self.report
+    }
 }
 
-fn extract_tool_target(
+pub(crate) fn extract_tool_target(
     name: &str,
     input: Option<&Value>,
     cwd: Option<&str>,
@@ -919,6 +970,45 @@ mod tests {
         assert_eq!(report.merge_audits[0].build_success, Some(false));
         assert_eq!(report.merge_audits[0].suspect_files.len(), 1);
         assert!(report.merge_audits[0].build_error.is_some());
+    }
+
+    #[test]
+    fn incremental_snapshots_match_full_analysis_without_double_counting() {
+        let lines = vec![
+            json!({"message": {"id": "msg-1", "content": [], "usage": {
+                "input_tokens": 100, "cache_creation_input_tokens": 5, "output_tokens": 2
+            }}})
+            .to_string(),
+            tool_call("read-1", "Read", json!({"file_path": "a.rs"}), None),
+            tool_result("read-1", true),
+            json!({"message": {"id": "msg-2", "content": [], "usage": {
+                "input_tokens": 160, "output_tokens": 1
+            }}})
+            .to_string(),
+            json!({"message": {"id": "msg-2", "content": [], "usage": {
+                "input_tokens": 160, "output_tokens": 4
+            }}})
+            .to_string(),
+        ];
+        let expected = analyze(lines.clone());
+        let mut incremental = IncrementalAnalyzer::new("test", false, 10_000);
+        for line in &lines {
+            let raw = serde_json::from_str::<RawLine>(line).unwrap();
+            incremental.ingest(&raw);
+            incremental.refresh();
+        }
+        let actual = incremental.report();
+        assert_eq!(actual.turns, expected.turns);
+        assert_eq!(actual.startup_cache_tokens, expected.startup_cache_tokens);
+        assert_eq!(actual.peak_context_tokens, expected.peak_context_tokens);
+        assert_eq!(actual.current_context_tokens, 160);
+        assert_eq!(actual.total_tokens, expected.total_tokens);
+        assert_eq!(actual.total_tokens, 271);
+        assert_eq!(actual.tool_token_delta, expected.tool_token_delta);
+        assert_eq!(actual.tool_token_delta.get("Read"), Some(&55));
+        assert_eq!(actual.actions.len(), expected.actions.len());
+        assert_eq!(actual.actions[0].delta, expected.actions[0].delta);
+        assert_eq!(actual.actions[0].error, expected.actions[0].error);
     }
 
     #[test]

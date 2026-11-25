@@ -1,34 +1,51 @@
-use super::app::{App, Focus, ViewTab};
+use super::{
+    app::{App, Focus, ViewMode, ViewTab},
+    live::LiveStatus,
+};
 use crate::analyzer::analyzer::AgentReport;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+    },
 };
+
+const CONTEXT_LIMIT: u64 = 1_000_000;
+const CONTEXT_WARN: u64 = 900_000;
+
+fn context_fill(tokens: u64) -> usize {
+    (tokens.min(CONTEXT_LIMIT) as usize * 8 / CONTEXT_LIMIT as usize).min(8)
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(1),
             Constraint::Length(4),
         ])
         .split(frame.area());
     draw_header(frame, app, areas[0]);
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(areas[1]);
-    draw_tree(frame, app, body[0]);
-    draw_detail(frame, app, body[1]);
+    match app.mode {
+        ViewMode::Compact => draw_compact(frame, app, areas[1]),
+        ViewMode::Diagnostic => {
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+                .split(areas[1]);
+            draw_tree(frame, app, body[0]);
+            draw_detail(frame, app, body[1]);
+        }
+    }
 
     let footer = vec![
         Line::from(
-            "q/Esc Quit  h/l Focus  j/k/↑/↓ Move/Scroll  Tab/1-4 View  PgUp/PgDn Page  r Refresh  y Copy",
+            "q/Esc Quit  v View  h/l Focus  j/k/↑/↓ Move/Scroll  Tab/1-4 Tabs  PgUp/PgDn  r Full reload  y Copy",
         ),
         Line::from(Span::styled(
             app.status.clone(),
@@ -64,42 +81,137 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Span::styled("[PAUSED]", Style::default().fg(Color::Red))
     };
-    let line = Line::from(vec![
+    let session = Line::from(vec![
+        Span::raw(format!("Session: {}  |  ", app.report.session_id)),
+        live,
+        Span::raw(format!("  |  Agents: {}", app.report.agents.len())),
+    ]);
+    let stats = Line::from(vec![
+        header_status_span(LiveStatus::Running),
+        Span::raw(format!(": {}  |  ", app.status_count(LiveStatus::Running))),
+        header_status_span(LiveStatus::Queued),
+        Span::raw(format!(": {}  |  ", app.status_count(LiveStatus::Queued))),
+        header_status_span(LiveStatus::Completed),
         Span::raw(format!(
-            "Session: {}  |  Tokens: {} (cold {} / {:.1}%)  |  Agents: {}  |  ",
-            app.report.session_id,
+            ": {}  |  ",
+            app.status_count(LiveStatus::Completed)
+        )),
+        header_status_span(LiveStatus::Failed),
+        Span::raw(format!(
+            ": {}  |  Tokens: {}  |  Cold: {} ({:.1}%)",
+            app.status_count(LiveStatus::Failed),
             total,
             cold,
-            cold_pct,
-            app.report.agents.len()
+            cold_pct
         )),
-        live,
     ]);
     frame.render_widget(
-        Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("spec-xray")),
+        Paragraph::new(vec![session, stats]).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("spec-xray Phase 2"),
+        ),
         area,
     );
+}
+
+fn status_style(status: LiveStatus) -> Style {
+    let color = match status {
+        LiveStatus::Queued => Color::Rgb(110, 130, 150),
+        LiveStatus::Running => Color::Cyan,
+        LiveStatus::Completed => Color::Green,
+        LiveStatus::Failed => Color::Red,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn status_span(status: LiveStatus) -> Span<'static> {
+    Span::styled(status.label(), status_style(status))
+}
+
+fn header_status_span(status: LiveStatus) -> Span<'static> {
+    Span::styled(status.name(), status_style(status))
+}
+
+fn draw_compact(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.right_height = area.height.saturating_sub(3);
+    let header = Row::new([
+        "Main / Subagent (Ticket)",
+        "Status",
+        "Turns",
+        "Context",
+        "Tokens",
+        "Action / elapsed",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let rows = app.rows.iter().map(|row| {
+        let mut task = vec![Span::raw(format!(
+            "{}{} ({})",
+            row.prefix, row.label, row.agent_id
+        ))];
+        if row.compacted {
+            task.push(Span::styled(" [COMPACT]", Style::default().fg(Color::Cyan)));
+        }
+        let filled = context_fill(row.context_tokens);
+        let context_color = if row.context_tokens >= CONTEXT_WARN {
+            Color::Rgb(255, 110, 70)
+        } else {
+            Color::Cyan
+        };
+        let context = Line::from(vec![
+            Span::styled(
+                format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled)),
+                Style::default().fg(context_color),
+            ),
+            Span::raw(format!(" {:>3}k/1M", row.context_tokens / 1_000)),
+        ]);
+        Row::new(vec![
+            Cell::from(Line::from(task)),
+            Cell::from(status_span(row.status)),
+            Cell::from(row.turns.to_string()),
+            Cell::from(context),
+            Cell::from(row.tokens.to_string()),
+            Cell::from(format!("{} ({}s)", row.action, row.action_secs)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(26),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Length(23),
+            Constraint::Length(12),
+            Constraint::Min(24),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Compact live tree — v: diagnostics"),
+    )
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
+    .highlight_symbol("▶ ");
+    let selected = (!app.rows.is_empty()).then_some(app.selected);
+    let mut state = TableState::default().with_selected(selected);
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Tree;
     let items = app.rows.iter().map(|row| {
-        let (status, color) = if row.loop_failures >= 3 {
-            ("[LOOP!]", Color::Yellow)
-        } else if row.has_errors {
-            ("[ERR]", Color::Red)
-        } else {
-            ("[OK]", Color::Green)
-        };
         let mut spans = vec![
             Span::raw(format!(
                 "{}{} {} — {} tok ",
                 row.prefix, row.agent_id, row.label, row.tokens
             )),
-            Span::styled(
-                status,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
+            status_span(row.status),
         ];
         if row.compacted {
             spans.push(Span::styled(" [COMPACT]", Style::default().fg(Color::Cyan)));
@@ -403,4 +515,62 @@ fn muted(text: &'static str) -> Line<'static> {
 
 fn empty(text: &'static str) -> Vec<Line<'static>> {
     vec![muted(text)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use serde_json::json;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    fn project() -> PathBuf {
+        let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("spec-xray-view-{}-{id}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let line = json!({
+            "message": {"id": "message-1", "role": "assistant", "content": [{
+                "type": "tool_use", "id": "task-1", "name": "Agent",
+                "input": {"description": "Render ticket"}
+            }], "usage": {"input_tokens": 150_000}}
+        });
+        fs::write(directory.join("session.jsonl"), format!("{line}\n")).unwrap();
+        directory
+    }
+
+    #[test]
+    fn renders_both_views_and_every_diagnostic_tab() {
+        let project = project();
+        let mut app = App::new(&project, Some("session"), 10_000).unwrap();
+        app.live = true;
+        let backend = TestBackend::new(120, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        app.mode = ViewMode::Diagnostic;
+        for tab in ViewTab::ALL {
+            app.tab = tab;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
+        app.mode = ViewMode::Compact;
+        terminal.backend_mut().resize(80, 20);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let _ = fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn context_progress_uses_one_million_token_limit() {
+        assert_eq!(context_fill(0), 0);
+        assert_eq!(context_fill(500_000), 4);
+        assert_eq!(context_fill(1_000_000), 8);
+        assert_eq!(context_fill(2_000_000), 8);
+        assert_eq!(CONTEXT_WARN, 900_000);
+    }
 }

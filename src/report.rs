@@ -2,6 +2,16 @@ use crate::{analyzer::analyzer::SessionReport, parser::tree};
 use indoc::indoc;
 
 pub fn render_markdown(report: &SessionReport) -> String {
+    let topology =
+        tree::build_topology(&report.project_dir, &report.session_id, &report.agents).ok();
+    render_markdown_with_topology(report, topology.as_ref())
+}
+
+/// 使用调用方已有的拓扑渲染报告，避免实时视图为了 Markdown 重读日志。
+pub fn render_markdown_with_topology(
+    report: &SessionReport,
+    cached_topology: Option<&tree::SessionTopology>,
+) -> String {
     let total_all: u64 = report.agents.iter().map(|a| a.total_tokens).sum();
 
     let header = format!(
@@ -20,22 +30,20 @@ pub fn render_markdown(report: &SessionReport) -> String {
     );
 
     // 0. 执行拓扑与时间轴树
-    let topology: String =
-        match tree::build_topology(&report.project_dir, &report.session_id, &report.agents) {
-            Ok(topo) => {
-                let ascii_tree = tree::render_ascii_tree(&topo);
-                format!(
-                    indoc! {r#"
-                    ## 0. Subagent 执行拓扑与耗时
-                    ```text
-                    {ascii_tree}```
+    let topology: String = cached_topology
+        .map(|topology| {
+            let ascii_tree = tree::render_ascii_tree(topology);
+            format!(
+                indoc! {r#"
+                ## 0. Subagent 执行拓扑与耗时
+                ```text
+                {ascii_tree}```
 
-                "#},
-                    ascii_tree = ascii_tree,
-                )
-            }
-            Err(_) => String::new(),
-        };
+            "#},
+                ascii_tree = ascii_tree,
+            )
+        })
+        .unwrap_or_default();
 
     // 1. Subagent 消耗与健康度总览表
     let agent_rows = report

@@ -1,8 +1,5 @@
-use crate::{
-    analyzer::analyzer::{AgentReport, SessionReport, analyze_session, list_sessions},
-    parser::tree::{SessionTopology, TopologyNode, build_topology},
-    report::render_markdown,
-};
+use super::live::{LiveSnapshot, LiveStatus, LiveTracker, TreeRow};
+use crate::analyzer::analyzer::{AgentReport, SessionReport, list_sessions};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -16,6 +13,12 @@ use std::{
 pub enum Focus {
     Tree,
     Detail,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    Compact,
+    Diagnostic,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,29 +42,15 @@ impl ViewTab {
     }
 }
 
-pub struct TreeRow {
-    pub agent_id: String,
-    pub label: String,
-    pub prefix: String,
-    pub tokens: u64,
-    pub has_errors: bool,
-    pub loop_failures: usize,
-    pub compacted: bool,
-}
-
-struct SessionData {
-    report: SessionReport,
-    markdown: String,
-    rows: Vec<TreeRow>,
-}
-
 pub struct App {
     project_dir: PathBuf,
     threshold: u64,
+    tracker: LiveTracker,
     pub report: SessionReport,
     pub markdown: String,
     pub rows: Vec<TreeRow>,
     pub selected: usize,
+    pub mode: ViewMode,
     pub focus: Focus,
     pub tab: ViewTab,
     pub right_scroll: u16,
@@ -74,6 +63,7 @@ pub struct App {
     events: Option<Receiver<notify::Result<notify::Event>>>,
     dirty: bool,
     last_change: Instant,
+    last_tick: Instant,
 }
 
 impl App {
@@ -88,14 +78,17 @@ impl App {
                     .0
             }
         };
-        let data = load_data(project_dir, &session_id, threshold)?;
+        let tracker = LiveTracker::load(project_dir, &session_id, threshold)?;
+        let snapshot = tracker.snapshot();
         Ok(Self {
             project_dir: project_dir.to_path_buf(),
             threshold,
-            report: data.report,
-            markdown: data.markdown,
-            rows: data.rows,
+            tracker,
+            report: snapshot.report,
+            markdown: snapshot.markdown,
+            rows: snapshot.rows,
             selected: 0,
+            mode: ViewMode::Compact,
             focus: Focus::Tree,
             tab: ViewTab::Radar,
             right_scroll: 0,
@@ -108,6 +101,7 @@ impl App {
             events: None,
             dirty: false,
             last_change: Instant::now(),
+            last_tick: Instant::now(),
         })
     }
 
@@ -131,7 +125,6 @@ impl App {
         let session_dir = self.project_dir.join(&self.report.session_id);
         let mut changed = false;
         let mut disconnected = false;
-
         if let Some(events) = &self.events {
             loop {
                 match events.try_recv() {
@@ -159,8 +152,8 @@ impl App {
                 }
             }
         }
-
         if disconnected {
+            self.events = None;
             self.live = false;
             self.status = "File watcher disconnected; press r to refresh.".into();
         }
@@ -168,29 +161,65 @@ impl App {
             self.dirty = true;
             self.last_change = Instant::now();
         }
-        if self.dirty && self.last_change.elapsed() >= Duration::from_millis(100) {
+        let debounced = self.dirty && self.last_change.elapsed() >= Duration::from_millis(100);
+        let tick = self.last_tick.elapsed() >= Duration::from_millis(500);
+        if debounced || tick {
             self.dirty = false;
-            self.reload();
+            self.last_tick = Instant::now();
+            self.refresh();
         }
     }
 
-    pub fn reload(&mut self) {
-        match load_data(&self.project_dir, &self.report.session_id, self.threshold) {
-            Ok(data) => {
-                self.report = data.report;
-                self.markdown = data.markdown;
-                self.rows = data.rows;
-                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
-                self.right_scroll = 0;
-                self.status = "Refreshed.".into();
+    fn refresh(&mut self) {
+        match self.tracker.poll() {
+            Ok(changed) => {
+                self.apply_snapshot();
+                if changed {
+                    self.status = "Incrementally refreshed.".into();
+                }
             }
             Err(error) => self.status = format!("Refresh failed: {error:#}"),
         }
     }
 
+    pub fn reload(&mut self) {
+        match LiveTracker::load(&self.project_dir, &self.report.session_id, self.threshold) {
+            Ok(tracker) => {
+                self.tracker = tracker;
+                self.apply_snapshot();
+                self.right_scroll = 0;
+                self.status = "Fully reloaded.".into();
+            }
+            Err(error) => self.status = format!("Full reload failed: {error:#}"),
+        }
+    }
+
+    fn apply_snapshot(&mut self) {
+        let selected_id = self.rows.get(self.selected).map(|row| row.agent_id.clone());
+        let LiveSnapshot {
+            report,
+            markdown,
+            rows,
+        } = self.tracker.snapshot();
+        self.report = report;
+        self.markdown = markdown;
+        self.rows = rows;
+        self.selected = selected_id
+            .and_then(|id| self.rows.iter().position(|row| row.agent_id == id))
+            .unwrap_or_else(|| self.selected.min(self.rows.len().saturating_sub(1)));
+        let max_scroll = self.right_len.saturating_sub(self.right_height as usize);
+        self.right_scroll = self
+            .right_scroll
+            .min(max_scroll.min(u16::MAX as usize) as u16);
+    }
+
     pub fn selected_agent(&self) -> Option<&AgentReport> {
         let id = self.rows.get(self.selected)?.agent_id.as_str();
         self.report.agents.iter().find(|agent| agent.agent_id == id)
+    }
+
+    pub fn status_count(&self, status: LiveStatus) -> usize {
+        self.rows.iter().filter(|row| row.status == status).count()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -199,17 +228,40 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('v') => {
+                self.mode = match self.mode {
+                    ViewMode::Compact => ViewMode::Diagnostic,
+                    ViewMode::Diagnostic => ViewMode::Compact,
+                };
+                self.right_scroll = 0;
+            }
             KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Tree,
             KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Detail,
-            KeyCode::Tab => self.select_tab((self.tab.index() + 1) % ViewTab::ALL.len()),
-            KeyCode::Char('1') => self.select_tab(0),
-            KeyCode::Char('2') => self.select_tab(1),
-            KeyCode::Char('3') => self.select_tab(2),
-            KeyCode::Char('4') => self.select_tab(3),
+            KeyCode::Tab if self.mode == ViewMode::Diagnostic => {
+                self.select_tab((self.tab.index() + 1) % ViewTab::ALL.len());
+            }
+            KeyCode::Char('1') if self.mode == ViewMode::Diagnostic => self.select_tab(0),
+            KeyCode::Char('2') if self.mode == ViewMode::Diagnostic => self.select_tab(1),
+            KeyCode::Char('3') if self.mode == ViewMode::Diagnostic => self.select_tab(2),
+            KeyCode::Char('4') if self.mode == ViewMode::Diagnostic => self.select_tab(3),
+            KeyCode::PageUp if self.mode == ViewMode::Compact => {
+                self.move_tree(-(self.right_height.max(1) as i32));
+            }
+            KeyCode::PageDown if self.mode == ViewMode::Compact => {
+                self.move_tree(self.right_height.max(1) as i32);
+            }
             KeyCode::PageUp => self.scroll_detail(-(self.right_height.max(1) as i32)),
             KeyCode::PageDown => self.scroll_detail(self.right_height.max(1) as i32),
-            KeyCode::Char('j') | KeyCode::Down if self.focus == Focus::Tree => self.move_tree(1),
-            KeyCode::Char('k') | KeyCode::Up if self.focus == Focus::Tree => self.move_tree(-1),
+            KeyCode::Char('j') | KeyCode::Down
+                if self.mode == ViewMode::Compact || self.focus == Focus::Tree =>
+            {
+                self.move_tree(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if self.mode == ViewMode::Compact || self.focus == Focus::Tree =>
+            {
+                self.move_tree(-1);
+            }
             KeyCode::Char('j') | KeyCode::Down => self.scroll_detail(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_detail(-1),
             KeyCode::Char('r') => self.reload(),
@@ -248,80 +300,5 @@ impl App {
             Ok(()) => "Copied to clipboard!".into(),
             Err(error) => format!("Clipboard error: {error}"),
         };
-    }
-}
-
-fn load_data(project_dir: &Path, session_id: &str, threshold: u64) -> Result<SessionData> {
-    let report = analyze_session(project_dir, session_id, threshold)?;
-    let topology = build_topology(project_dir, session_id, &report.agents)?;
-    let rows = flatten_topology(&topology, &report.agents);
-    let markdown = render_markdown(&report);
-    Ok(SessionData {
-        report,
-        markdown,
-        rows,
-    })
-}
-
-fn flatten_topology(topology: &SessionTopology, agents: &[AgentReport]) -> Vec<TreeRow> {
-    let mut rows = Vec::new();
-    flatten_node(&topology.root, "", true, true, false, agents, &mut rows);
-    for orphan in &topology.orphans {
-        flatten_node(orphan, "", true, true, true, agents, &mut rows);
-    }
-    rows
-}
-
-fn flatten_node(
-    node: &TopologyNode,
-    prefix: &str,
-    is_last: bool,
-    is_root: bool,
-    detached: bool,
-    agents: &[AgentReport],
-    rows: &mut Vec<TreeRow>,
-) {
-    let connector = if is_root {
-        ""
-    } else if is_last {
-        "└─ "
-    } else {
-        "├─ "
-    };
-    let compacted = agents
-        .iter()
-        .find(|agent| agent.agent_id == node.agent_id)
-        .is_some_and(|agent| !agent.compactions.is_empty());
-    rows.push(TreeRow {
-        agent_id: node.agent_id.clone(),
-        label: if detached {
-            format!("[detached] {}", node.label)
-        } else {
-            node.label.clone()
-        },
-        prefix: format!("{prefix}{connector}"),
-        tokens: node.total_tokens,
-        has_errors: node.has_errors,
-        loop_failures: node.max_consecutive_failures,
-        compacted,
-    });
-
-    let child_prefix = if is_root {
-        String::new()
-    } else if is_last {
-        format!("{prefix}   ")
-    } else {
-        format!("{prefix}│  ")
-    };
-    for (index, child) in node.children.iter().enumerate() {
-        flatten_node(
-            child,
-            &child_prefix,
-            index + 1 == node.children.len(),
-            false,
-            false,
-            agents,
-            rows,
-        );
     }
 }
