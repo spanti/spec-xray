@@ -3,9 +3,12 @@ name = "spec-xray"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/mod.rs"
+
 [dependencies]
 anyhow = "1.0.105"
-chrono = "0.4.45"
+chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.9", features = ["derive"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"

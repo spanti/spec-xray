@@ -1,4 +1,4 @@
-use crate::schema::{RawLine, ToolInvocation};
+use crate::parser::schema::{RawLine, ToolInvocation};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};

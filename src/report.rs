@@ -1,4 +1,4 @@
-use crate::analyzer::SessionReport;
+use crate::{analyzer::analyzer::SessionReport, parser::tree};
 use indoc::indoc;
 
 pub fn render_markdown(report: &SessionReport) -> String {
@@ -18,6 +18,27 @@ pub fn render_markdown(report: &SessionReport) -> String {
         total_all,
         total_all as f64 / 1_000_000.0,
     );
+
+    // 0. 执行拓扑与时间轴树
+    let topology: String = match tree::build_topology(
+        &report.project_dir,
+        &report.session_id,
+        &report.agents,
+    ) {
+        Ok(topo) => {
+            let ascii_tree = tree::render_ascii_tree(&topo);
+            format!(
+                indoc! {r#"
+                    ## 0. Subagent 执行拓扑与耗时
+                    ```text
+                    {ascii_tree}```
+
+                "#},
+                ascii_tree = ascii_tree,
+            )
+        }
+        Err(_) => String::new(),
+    };
 
     // 1. Subagent 消耗与健康度总览表
     let agent_rows = report
@@ -183,5 +204,5 @@ pub fn render_markdown(report: &SessionReport) -> String {
         )
     };
 
-    format!("{header}{overview}{clashes}{bloat}{failures}")
+    format!("{header}{topology}{overview}{clashes}{bloat}{failures}")
 }

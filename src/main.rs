@@ -1,8 +1,5 @@
-mod analyzer;
-mod report;
-mod schema;
-
 use anyhow::{Context, Result, bail};
+use spec_xray::{analyzer::analyzer, report};
 use clap::{Parser, Subcommand};
 use std::{
     fs,
