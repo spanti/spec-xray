@@ -1,5 +1,8 @@
-use crate::analyzer::analyzer::{AgentReport, extract_tool_target, is_merge_command};
 use crate::parser::schema::RawLine;
+use crate::{
+    analyzer::analyzer::{AgentReport, extract_tool_target, is_merge_command},
+    format_tokens,
+};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -378,13 +381,13 @@ fn render_node_recursive(
 
     writeln!(
         out,
-        "{}{}{} `{}` ({}) — {}k tok [{}]",
+        "{}{}{} `{}` ({}) — {} tok [{}]",
         prefix,
         connector,
         status,
         node.agent_id,
         node.label,
-        node.total_tokens / 1000,
+        format_tokens(node.total_tokens),
         timing
     )
     .unwrap();

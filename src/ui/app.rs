@@ -33,10 +33,17 @@ pub enum ViewTab {
     Merge,
     Timeline,
     Report,
+    Gantt,
 }
 
 impl ViewTab {
-    pub const ALL: [Self; 4] = [Self::Radar, Self::Merge, Self::Timeline, Self::Report];
+    pub const ALL: [Self; 5] = [
+        Self::Radar,
+        Self::Merge,
+        Self::Timeline,
+        Self::Report,
+        Self::Gantt,
+    ];
 
     pub fn index(self) -> usize {
         match self {
@@ -44,6 +51,7 @@ impl ViewTab {
             Self::Merge => 1,
             Self::Timeline => 2,
             Self::Report => 3,
+            Self::Gantt => 4,
         }
     }
 }
@@ -279,6 +287,7 @@ impl App {
             KeyCode::Char('2') if self.mode == ViewMode::Diagnostic => self.select_tab(1),
             KeyCode::Char('3') if self.mode == ViewMode::Diagnostic => self.select_tab(2),
             KeyCode::Char('4') if self.mode == ViewMode::Diagnostic => self.select_tab(3),
+            KeyCode::Char('5') if self.mode == ViewMode::Diagnostic => self.select_tab(4),
             KeyCode::PageUp if self.mode == ViewMode::Compact => {
                 self.move_tree(-(self.right_height.max(1) as i32));
             }

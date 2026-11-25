@@ -1,4 +1,4 @@
-use crate::{analyzer::analyzer::SessionReport, gantt::render_gantt, parser::tree};
+use crate::{analyzer::analyzer::SessionReport, format_tokens, gantt::render_gantt, parser::tree};
 use indoc::indoc;
 
 pub fn render_markdown(report: &SessionReport) -> String {
@@ -19,14 +19,13 @@ pub fn render_markdown_with_topology(
             # spec-xray 会话诊断报告
             - **Session ID**: `{}`
             - **Agent 总数**: {} (1 Main + {} Subagents)
-            - **累计 Token**: {} ({:.2}M)
+            - **累计 Token**: {}
 
         "#},
         report.session_id,
         report.agents.len(),
         report.agents.len().saturating_sub(1),
-        total_all,
-        total_all as f64 / 1_000_000.0,
+        format_tokens(total_all),
     );
 
     // 0. 执行拓扑与时间轴树
@@ -70,14 +69,14 @@ pub fn render_markdown_with_topology(
                 a.max_consecutive_failures.to_string()
             };
             format!(
-                "| `{}` | {} | `{}` | {} | {}k | {}k | {}k | {} |\n",
+                "| `{}` | {} | `{}` | {} | {} | {} | {} | {} |\n",
                 a.agent_id,
                 desc,
                 branch,
                 a.turns,
-                a.startup_cache_tokens / 1000,
-                a.peak_context_tokens / 1000,
-                a.total_tokens / 1000,
+                format_tokens(a.startup_cache_tokens),
+                format_tokens(a.peak_context_tokens),
+                format_tokens(a.total_tokens),
                 warn,
             )
         })
@@ -150,7 +149,7 @@ pub fn render_markdown_with_topology(
                 let summary: Vec<String> = tool_breakdown
                     .into_iter()
                     .filter(|&(_, &tok)| tok >= 1_000)
-                    .map(|(tool, tok)| format!("{}: +{}k", tool, tok / 1000))
+                    .map(|(tool, tok)| format!("{}: +{}", tool, format_tokens(*tok)))
                     .collect();
                 if !summary.is_empty() {
                     lines.push(format!("- **工具增量分布**: {}", summary.join(" | ")));
@@ -162,19 +161,23 @@ pub fn render_markdown_with_topology(
                     .map(|(path, count)| format!("- **重复全量 Read ({count} 次)**: `{path}`")),
             );
             lines.extend(a.heavy_ops.iter().take(5).map(|(op, delta)| {
-                format!("- **单步上下文激增 (+{}k tok)**: `{op}`", delta / 1000)
+                format!(
+                    "- **单步上下文激增 (+{} tok)**: `{op}`",
+                    format_tokens(*delta)
+                )
             }));
             lines.extend(a.compactions.iter().map(|c| match c.after_tokens {
                 Some(after) => format!(
                     "- **Compaction（已完成 {} 轮后）**: {} → {} tokens（下降 {}）",
                     c.turn,
-                    c.before_tokens,
-                    after,
-                    i128::from(c.before_tokens) - i128::from(after)
+                    format_tokens(c.before_tokens),
+                    format_tokens(after),
+                    format_tokens(i128::from(c.before_tokens) - i128::from(after))
                 ),
                 None => format!(
                     "- **Compaction（已完成 {} 轮后）**: {} → 未知 tokens",
-                    c.turn, c.before_tokens
+                    c.turn,
+                    format_tokens(c.before_tokens)
                 ),
             }));
 

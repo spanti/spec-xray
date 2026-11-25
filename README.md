@@ -10,7 +10,7 @@
 - 找出多个 Agent 修改同一文件的碰撞，并记录合并后的首次构建/测试结果。
 - 使用独立文件偏移和半行缓冲增量刷新 TUI，自动发现新的 `subagents/*.jsonl`。
 - 提供项目级 Session 统计、最近 10 次消耗趋势和交互式 Session 选择器。
-- 在 CLI 报告和 TUI Timeline 中展示并行甘特泳道、峰值并行、长尾瓶颈及超过 30 秒的编排 Gap。
+- 在 CLI 报告和独立的 TUI Gantt 标签中展示并行甘特泳道、峰值并行、长尾瓶颈及超过 30 秒的编排 Gap。
 
 ## 构建与安装
 
@@ -87,7 +87,7 @@ Commands:
 | `v` | 切换紧凑树与诊断分栏视图 |
 | `j` / `k` / `↓` / `↑` | 移动树节点；Detail 获得焦点时滚动详情 |
 | `h` / `l` / `←` / `→` | 切换 Tree/Detail 焦点 |
-| `Tab` / `1`～`4` | 在诊断视图切换 Radar、Merge/Clashes、Timeline、Report |
+| `Tab` / `1`～`5` | 在诊断视图切换 Radar、Merge/Clashes、Timeline、Report、Gantt |
 | `PgUp` / `PgDn` | 紧凑树翻页或诊断详情翻页 |
 | `r` | 完整重载当前会话并重置增量读取状态 |
 | `y` | 复制当前会话的 Markdown 报告 |

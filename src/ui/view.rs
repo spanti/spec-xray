@@ -1,9 +1,9 @@
 use super::{
     app::{App, Focus, ViewMode, ViewTab},
     live::LiveStatus,
-    sessions::{ProjectSessions, SessionStatus, format_tokens},
+    sessions::{ProjectSessions, SessionStatus},
 };
-use crate::analyzer::analyzer::AgentReport;
+use crate::{analyzer::analyzer::AgentReport, format_tokens};
 use chrono::Utc;
 use ratatui::{
     Frame,
@@ -11,7 +11,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+        Block, BorderType, Borders, Cell, List, ListItem, ListState, Padding, Paragraph, Row,
+        Table, TableState, Wrap,
     },
 };
 
@@ -20,6 +21,48 @@ const CONTEXT_WARN: u64 = 900_000;
 
 fn context_fill(tokens: u64) -> usize {
     (tokens.min(CONTEXT_LIMIT) as usize * 8 / CONTEXT_LIMIT as usize).min(8)
+}
+
+fn panel(title: &'static str, focused: bool) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
+        .padding(Padding::horizontal(1))
+        .title(title)
+}
+
+fn key_hints(hints: &[(&'static str, &'static str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, description)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            *key,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {description}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn short_agent_id(agent_id: &str) -> String {
+    agent_id
+        .strip_prefix("agent-")
+        .unwrap_or(agent_id)
+        .chars()
+        .take(7)
+        .collect()
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -50,18 +93,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     let footer = vec![
-        Line::from(
-            "q/Esc Quit  s Sessions  v View  h/l Focus  j/k/↑/↓ Move/Scroll  Tab/1-4 Tabs  PgUp/PgDn  r Reload  y Copy",
-        ),
+        key_hints(&[
+            ("q/Esc", "Quit"),
+            ("s", "Sessions"),
+            ("v", "View"),
+            ("h/l", "Focus"),
+            ("j/k", "Move/Scroll"),
+            ("Tab/1-5", "Tabs"),
+            ("PgUp/PgDn", "Page"),
+            ("r", "Reload"),
+            ("y", "Copy"),
+        ]),
         Line::from(Span::styled(
             app.status.clone(),
             Style::default().fg(Color::Yellow),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
-        areas[2],
-    );
+    frame.render_widget(Paragraph::new(footer).block(panel("", false)), areas[2]);
 }
 
 fn draw_session_selector(frame: &mut Frame, app: &mut App) {
@@ -93,7 +141,10 @@ fn draw_session_selector(frame: &mut Frame, app: &mut App) {
             Cell::from(format!("{} |", session.time_range(now))),
             Cell::from(format!("{:>5}轮 |", session.turns)),
             Cell::from(format!("{:>4} |", session.agents)),
-            Cell::from(format!("{:>6} |", format_tokens(session.tokens))),
+            Cell::from(Span::styled(
+                format!("{:>6} |", format_tokens(session.tokens)),
+                Style::default().fg(Color::Cyan),
+            )),
             Cell::from(Span::styled(
                 format!("{} |", status.label()),
                 session_status_style(status),
@@ -130,28 +181,31 @@ fn draw_session_selector(frame: &mut Frame, app: &mut App) {
         ),
     )
     .column_spacing(1)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Sessions — newest first"),
+    .block(panel("Sessions — newest first", true))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Indexed(236))
+            .add_modifier(Modifier::BOLD),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray))
     .highlight_symbol("▶ ");
     let selected = (!sessions.is_empty()).then_some(app.session_selected);
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, areas[1], &mut state);
 
     let footer = vec![
-        Line::from("s/Esc Back  Enter Load session  j/k/↑/↓ Move  PgUp/PgDn Page  r Rescan"),
+        key_hints(&[
+            ("s/Esc", "Back"),
+            ("Enter", "Load session"),
+            ("j/k", "Move"),
+            ("PgUp/PgDn", "Page"),
+            ("r", "Rescan"),
+        ]),
         Line::from(Span::styled(
             app.status.clone(),
             Style::default().fg(Color::Yellow),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
-        areas[2],
-    );
+    frame.render_widget(Paragraph::new(footer).block(panel("", false)), areas[2]);
 }
 
 fn draw_project_summary(frame: &mut Frame, catalog: Option<&ProjectSessions>, area: Rect) {
@@ -200,11 +254,15 @@ fn draw_project_summary(frame: &mut Frame, catalog: Option<&ProjectSessions>, ar
             };
             lines.push(Line::from(vec![
                 Span::raw(format!("{:>2} ", index + 1)),
+                Span::styled("█".repeat(filled), Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled)),
+                    "░".repeat(20 - filled),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!(" {:>7} ", format_tokens(session.tokens)),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::raw(format!(" {:>7} ", format_tokens(session.tokens))),
                 marker,
                 Span::styled(format!(" {}", status.label()), session_status_style(status)),
             ]));
@@ -216,11 +274,7 @@ fn draw_project_summary(frame: &mut Frame, catalog: Option<&ProjectSessions>, ar
         lines.push(muted("No project metadata. Press r to rescan."));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Project overview — all historical sessions"),
-        ),
+        Paragraph::new(lines).block(panel("Project overview — all historical sessions", false)),
         area,
     );
 }
@@ -262,7 +316,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         cold as f64 * 100.0 / total as f64
     };
     let live = if app.live {
-        Span::styled("[LIVE]", Style::default().fg(Color::Green))
+        Span::styled(
+            "[LIVE]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::styled("[PAUSED]", Style::default().fg(Color::Red))
     };
@@ -272,50 +331,66 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(format!("  |  Agents: {}", app.report.agents.len())),
     ]);
     let stats = Line::from(vec![
-        header_status_span(LiveStatus::Running),
-        Span::raw(format!(": {}  |  ", app.status_count(LiveStatus::Running))),
-        header_status_span(LiveStatus::Queued),
-        Span::raw(format!(": {}  |  ", app.status_count(LiveStatus::Queued))),
-        header_status_span(LiveStatus::Completed),
-        Span::raw(format!(
-            ": {}  |  ",
-            app.status_count(LiveStatus::Completed)
-        )),
-        header_status_span(LiveStatus::Failed),
-        Span::raw(format!(
-            ": {}  |  Tokens: {}  |  Cold: {} ({:.1}%)",
-            app.status_count(LiveStatus::Failed),
-            total,
-            cold,
-            cold_pct
-        )),
+        status_badge(LiveStatus::Running, app.status_count(LiveStatus::Running)),
+        Span::raw(" "),
+        status_badge(LiveStatus::Queued, app.status_count(LiveStatus::Queued)),
+        Span::raw(" "),
+        status_badge(
+            LiveStatus::Completed,
+            app.status_count(LiveStatus::Completed),
+        ),
+        Span::raw(" "),
+        status_badge(LiveStatus::Failed, app.status_count(LiveStatus::Failed)),
+        Span::raw("  Tokens: "),
+        Span::styled(format_tokens(total), Style::default().fg(Color::Cyan)),
+        Span::raw("  |  Cold: "),
+        Span::styled(
+            format!("{} ({cold_pct:.1}%)", format_tokens(cold)),
+            Style::default().fg(Color::Cyan),
+        ),
     ]);
     frame.render_widget(
-        Paragraph::new(vec![session, stats]).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("spec-xray Phase 2"),
-        ),
+        Paragraph::new(vec![session, stats]).block(panel("spec-xray", false)),
         area,
     );
 }
 
 fn status_style(status: LiveStatus) -> Style {
     let color = match status {
-        LiveStatus::Queued => Color::Rgb(110, 130, 150),
-        LiveStatus::Running => Color::Cyan,
+        LiveStatus::Queued => Color::DarkGray,
+        LiveStatus::Running => Color::Yellow,
         LiveStatus::Completed => Color::Green,
-        LiveStatus::Failed => Color::Red,
+        LiveStatus::Failed => Color::LightRed,
     };
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
+    let style = Style::default().fg(color);
+    if status == LiveStatus::Failed {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
 }
 
 fn status_span(status: LiveStatus) -> Span<'static> {
     Span::styled(status.label(), status_style(status))
 }
 
-fn header_status_span(status: LiveStatus) -> Span<'static> {
-    Span::styled(status.name(), status_style(status))
+fn status_badge(status: LiveStatus, count: usize) -> Span<'static> {
+    let style = match status {
+        LiveStatus::Running if count > 0 => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        LiveStatus::Completed if count > 0 => {
+            Style::default().fg(Color::Green).bg(Color::Indexed(236))
+        }
+        LiveStatus::Failed if count > 0 => Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+        LiveStatus::Queued if count > 0 => Style::default().bg(Color::Indexed(236)),
+        _ => Style::default().fg(Color::DarkGray),
+    };
+    Span::styled(format!(" {}: {count} ", status.name()), style)
 }
 
 fn draw_compact(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -330,14 +405,18 @@ fn draw_compact(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .style(
         Style::default()
-            .fg(Color::Gray)
+            .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     );
     let rows = app.rows.iter().map(|row| {
-        let mut task = vec![Span::raw(format!(
-            "{}{} ({})",
-            row.prefix, row.label, row.agent_id
-        ))];
+        let mut task = vec![
+            Span::styled(row.prefix.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(row.label.clone(), Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" ({})", short_agent_id(&row.agent_id)),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
         if row.compacted {
             task.push(Span::styled(" [COMPACT]", Style::default().fg(Color::Cyan)));
         }
@@ -348,18 +427,19 @@ fn draw_compact(frame: &mut Frame, app: &mut App, area: Rect) {
             Color::Cyan
         };
         let context = Line::from(vec![
-            Span::styled(
-                format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled)),
-                Style::default().fg(context_color),
-            ),
-            Span::raw(format!(" {:>3}k/1M", row.context_tokens / 1_000)),
+            Span::styled("█".repeat(filled), Style::default().fg(context_color)),
+            Span::styled("░".repeat(8 - filled), Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" {}/1M", format_tokens(row.context_tokens))),
         ]);
         Row::new(vec![
             Cell::from(Line::from(task)),
             Cell::from(status_span(row.status)),
             Cell::from(row.turns.to_string()),
             Cell::from(context),
-            Cell::from(row.tokens.to_string()),
+            Cell::from(Span::styled(
+                format_tokens(row.tokens),
+                Style::default().fg(Color::Cyan),
+            )),
             Cell::from(format!("{} ({}s)", row.action, row.action_secs)),
         ])
     });
@@ -376,12 +456,12 @@ fn draw_compact(frame: &mut Frame, app: &mut App, area: Rect) {
     )
     .header(header)
     .column_spacing(1)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Compact live tree — v: diagnostics"),
+    .block(panel("Compact live tree — v: diagnostics", true))
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Indexed(236))
+            .add_modifier(Modifier::BOLD),
     )
-    .row_highlight_style(Style::default().bg(Color::DarkGray))
     .highlight_symbol("▶ ");
     let selected = (!app.rows.is_empty()).then_some(app.selected);
     let mut state = TableState::default().with_selected(selected);
@@ -392,10 +472,16 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Tree;
     let items = app.rows.iter().map(|row| {
         let mut spans = vec![
-            Span::raw(format!(
-                "{}{} {} — {} tok ",
-                row.prefix, row.agent_id, row.label, row.tokens
-            )),
+            Span::styled(row.prefix.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                short_agent_id(&row.agent_id),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(" "),
+            Span::styled(row.label.clone(), Style::default().fg(Color::White)),
+            Span::raw(" "),
+            Span::styled(format_tokens(row.tokens), Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
             status_span(row.status),
         ];
         if row.compacted {
@@ -403,15 +489,13 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         }
         ListItem::new(Line::from(spans))
     });
-    let border = if focused { Color::Cyan } else { Color::Gray };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Subagent topology")
-                .border_style(Style::default().fg(border)),
+        .block(panel("Subagent topology", focused))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Indexed(236))
+                .add_modifier(Modifier::BOLD),
         )
-        .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
     let mut state = ListState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
@@ -419,11 +503,7 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Detail;
-    let border = if focused { Color::Cyan } else { Color::Gray };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Diagnostics")
-        .border_style(Style::default().fg(border));
+    let block = panel("Diagnostics", focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let sections = Layout::default()
@@ -434,20 +514,21 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut tabs = Vec::new();
     for (index, (tab, title)) in ViewTab::ALL
         .into_iter()
-        .zip(["1 Radar", "2 Merge/Clashes", "3 Timeline", "4 Report"])
+        .zip(["1 Radar", "2 Merge", "3 Timeline", "4 Report", "5 Gantt"])
         .enumerate()
     {
         if index > 0 {
-            tabs.push(Span::raw("  "));
+            tabs.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
         }
         let style = if tab == app.tab {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::Black)
+                .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(Color::DarkGray)
         };
-        tabs.push(Span::styled(title, style));
+        tabs.push(Span::styled(format!(" {title} "), style));
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), sections[0]);
 
@@ -469,25 +550,22 @@ fn detail_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             .map(radar_lines)
             .unwrap_or_else(|| empty("No agent selected.")),
         ViewTab::Merge => merge_lines(app),
-        ViewTab::Timeline => {
-            let track_width = width.saturating_sub(52).clamp(10, 60);
-            let mut lines: Vec<_> = crate::gantt::render_gantt(&app.topology, track_width)
-                .lines()
-                .map(|line| Line::from(line.to_string()))
-                .collect();
-            lines.push(Line::default());
-            lines.extend(
-                app.selected_agent()
-                    .map(timeline_lines)
-                    .unwrap_or_else(|| empty("No agent selected.")),
-            );
-            lines
-        }
+        ViewTab::Timeline => app
+            .selected_agent()
+            .map(timeline_lines)
+            .unwrap_or_else(|| empty("No agent selected.")),
         ViewTab::Report => app
             .markdown
             .lines()
             .map(|line| Line::from(line.to_string()))
             .collect(),
+        ViewTab::Gantt => {
+            let track_width = width.saturating_sub(52).clamp(10, 60);
+            crate::gantt::render_gantt(&app.topology, track_width)
+                .lines()
+                .map(|line| Line::from(line.to_string()))
+                .collect()
+        }
     }
 }
 
@@ -513,10 +591,17 @@ fn radar_lines(agent: &AgentReport) -> Vec<Line<'static>> {
             *tokens as f64 * 100.0 / total as f64
         };
         let filled = (percent * 0.2).round() as usize;
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled));
+        let name: String = tool.chars().take(12).collect();
+        let delta = format!("+{}", format_tokens(*tokens));
         lines.push(Line::from(vec![
-            Span::raw(format!("{tool:<12} +{tokens:<10} {percent:>5.1}%  ")),
-            Span::styled(bar, Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{name:<12}"), Style::default().fg(Color::White)),
+            Span::styled(format!("{delta:>9}"), Style::default().fg(Color::Cyan)),
+            Span::raw(format!("  {percent:>5.1}%  ")),
+            Span::styled("█".repeat(filled), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "░".repeat(20 - filled),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
 
@@ -530,13 +615,14 @@ fn radar_lines(agent: &AgentReport) -> Vec<Line<'static>> {
             Some(after) => format!(
                 "Turn {}  {} → {} tokens (Δ {})",
                 compact.turn,
-                compact.before_tokens,
-                after,
-                i128::from(compact.before_tokens) - i128::from(after)
+                format_tokens(compact.before_tokens),
+                format_tokens(after),
+                format_tokens(i128::from(compact.before_tokens) - i128::from(after))
             ),
             None => format!(
                 "Turn {}  {} → unknown tokens",
-                compact.turn, compact.before_tokens
+                compact.turn,
+                format_tokens(compact.before_tokens)
             ),
         })
     }));
@@ -563,13 +649,15 @@ fn radar_lines(agent: &AgentReport) -> Vec<Line<'static>> {
     if agent.heavy_ops.is_empty() {
         lines.push(muted("No operation exceeded the configured threshold."));
     }
-    lines.extend(
-        agent
-            .heavy_ops
-            .iter()
-            .take(10)
-            .map(|(operation, delta)| Line::from(format!("+{delta:<10} {operation}"))),
-    );
+    lines.extend(agent.heavy_ops.iter().take(10).map(|(operation, delta)| {
+        Line::from(vec![
+            Span::styled(
+                format!("+{:<9}", format_tokens(*delta)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(format!(" {operation}")),
+        ])
+    }));
     lines
 }
 
@@ -684,7 +772,11 @@ fn timeline_lines(agent: &AgentReport) -> Vec<Line<'static>> {
             .collect();
         let line = format!(
             "#{:<4} | {:<10} | {} | +{} | {}",
-            action.turn, action.tool, target, action.delta, error
+            action.turn,
+            action.tool,
+            target,
+            format_tokens(action.delta),
+            error
         );
         if action.error.is_some() {
             Line::from(Span::styled(line, Style::default().fg(Color::Red)))
@@ -725,6 +817,16 @@ mod tests {
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     fn project() -> PathBuf {
         let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let directory =
@@ -749,12 +851,25 @@ mod tests {
         let backend = TestBackend::new(120, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("spec-xray"));
+        assert!(rendered.contains("150.0k"));
+        assert_eq!(terminal.backend().buffer().content()[0].symbol(), "╭");
 
         app.mode = ViewMode::Diagnostic;
         for tab in ViewTab::ALL {
             app.tab = tab;
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         }
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("3 Timeline"));
+        assert!(rendered.contains("5 Gantt"));
+        app.tab = ViewTab::Radar;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('5'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.tab == ViewTab::Gantt);
         app.mode = ViewMode::Compact;
         terminal.backend_mut().resize(80, 20);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();

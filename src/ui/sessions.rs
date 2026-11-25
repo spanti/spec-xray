@@ -181,16 +181,6 @@ impl SessionSummary {
     }
 }
 
-pub fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.2}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{}k", tokens / 1_000)
-    } else {
-        tokens.to_string()
-    }
-}
-
 fn scan_file(path: &Path, is_main: bool, scan: &mut Scan) {
     let Ok(file) = File::open(path) else { return };
     let mut failures = 0;
@@ -379,8 +369,6 @@ mod tests {
         assert!(scan.merge_error && scan.max_failures == 3);
         assert_eq!(summary.status(Utc::now()), SessionStatus::Fail);
         assert!(summary.time_range(Utc::now()).contains("(02m00s)"));
-        assert_eq!(format_tokens(1_420_000), "1.42M");
-        assert_eq!(format_tokens(850_000), "850k");
         let mut summary = catalog.sessions.into_iter().next().unwrap();
         summary.last = Utc::now();
         summary.failed = false;
