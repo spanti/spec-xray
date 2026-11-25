@@ -232,7 +232,8 @@ fn scan_agent_links(agent_id: &str, path: &Path) -> Result<AgentLinkMeta> {
             parent_tool_use_id = raw.parent_tool_use_id.clone();
         }
 
-        let Some(Value::Array(blocks)) = raw.message.and_then(|m| m.content) else {
+        let Some(Value::Array(blocks)) = raw.message.as_ref().and_then(|m| m.content.as_ref())
+        else {
             continue;
         };
 
@@ -241,7 +242,11 @@ fn scan_agent_links(agent_id: &str, path: &Path) -> Result<AgentLinkMeta> {
                 "tool_use" => {
                     let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     if name == "Task" || name == "Agent" {
-                        let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let desc = block
                             .get("input")
                             .and_then(|i| i.get("description"))
@@ -263,9 +268,12 @@ fn scan_agent_links(agent_id: &str, path: &Path) -> Result<AgentLinkMeta> {
                     }
                 }
                 "tool_result" => {
-                    let tuid = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let tuid = block
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if let Some(&idx) = pending_spawns.get(tuid) {
-                        spawns[idx].resolved_child_id = extract_agent_id(block.get("content"));
+                        spawns[idx].resolved_child_id = raw.spawned_agent_id(block.get("content"));
                     }
                 }
                 _ => {}
@@ -278,24 +286,6 @@ fn scan_agent_links(agent_id: &str, path: &Path) -> Result<AgentLinkMeta> {
         last_ts,
         parent_tool_use_id,
         spawns,
-    })
-}
-
-fn extract_agent_id(content: Option<&Value>) -> Option<String> {
-    let text = match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => return None,
-    };
-    text.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("agentId:")
-            .map(|rest| rest.trim().trim_matches('"').trim_matches('\'').to_string())
-            .filter(|id| !id.is_empty())
     })
 }
 

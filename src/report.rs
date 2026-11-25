@@ -118,7 +118,11 @@ pub fn render_markdown(report: &SessionReport) -> String {
             let mut tool_breakdown: Vec<_> = a.tool_token_delta.iter().collect();
             tool_breakdown.sort_by(|x, y| y.1.cmp(x.1));
 
-            if dup_reads.is_empty() && a.heavy_ops.is_empty() && tool_breakdown.is_empty() {
+            if dup_reads.is_empty()
+                && a.heavy_ops.is_empty()
+                && tool_breakdown.is_empty()
+                && a.compactions.is_empty()
+            {
                 return None;
             }
 
@@ -145,6 +149,19 @@ pub fn render_markdown(report: &SessionReport) -> String {
             );
             lines.extend(a.heavy_ops.iter().take(5).map(|(op, delta)| {
                 format!("- **单步上下文激增 (+{}k tok)**: `{op}`", delta / 1000)
+            }));
+            lines.extend(a.compactions.iter().map(|c| match c.after_tokens {
+                Some(after) => format!(
+                    "- **Compaction（已完成 {} 轮后）**: {} → {} tokens（下降 {}）",
+                    c.turn,
+                    c.before_tokens,
+                    after,
+                    i128::from(c.before_tokens) - i128::from(after)
+                ),
+                None => format!(
+                    "- **Compaction（已完成 {} 轮后）**: {} → 未知 tokens",
+                    c.turn, c.before_tokens
+                ),
             }));
 
             Some(lines.join("\n"))

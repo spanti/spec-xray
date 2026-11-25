@@ -1,10 +1,18 @@
-use crate::parser::schema::{RawLine, ToolInvocation};
+use crate::parser::schema::{RawLine, ToolInvocation, Usage};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+pub struct CompactionReport {
+    /// 压缩发生前已完成的 usage 轮次数
+    pub turn: usize,
+    pub before_tokens: u64,
+    pub after_tokens: Option<u64>,
+}
 
 #[derive(Debug, Default)]
 pub struct AgentReport {
@@ -17,14 +25,15 @@ pub struct AgentReport {
     pub startup_cache_tokens: u64,
     pub peak_context_tokens: u64,
     pub total_tokens: u64,
+    pub compactions: Vec<CompactionReport>,
     /// 工具名 -> 累计触发的上下文增量估算
     pub tool_token_delta: HashMap<String, u64>,
     /// 单次大体积噪音操作：(工具/目标, 增量 tokens)
     pub heavy_ops: Vec<(String, u64)>,
     /// 文件路径 -> 无行号限制的 Read 次数
     pub full_read_counts: HashMap<String, usize>,
-    /// Edit / Write 修改过的文件集合
-    pub edited_files: HashSet<String>,
+    /// Edit / Write 修改过的文件 -> 最后一次成功修改时的分支
+    pub edited_files: HashMap<String, Option<String>>,
     /// 失败的 Bash 构建/测试记录
     pub failed_commands: Vec<(String, String)>,
     /// 连续失败死循环次数（连续 >=3 次失败记为风暴）
@@ -138,11 +147,12 @@ pub fn analyze_session(
             Some(desc) => format!("`{}` ({})", agent.agent_id, desc),
             None => format!("`{}`", agent.agent_id),
         };
-        for file in &agent.edited_files {
-            file_editors
-                .entry(file.clone())
-                .or_default()
-                .push(display_name.clone());
+        for (file, edit_branch) in &agent.edited_files {
+            let editor = match edit_branch {
+                Some(branch) => format!("{display_name} [`{branch}`]"),
+                None => display_name.clone(),
+            };
+            file_editors.entry(file.clone()).or_default().push(editor);
         }
     }
     let file_clashes: BTreeMap<String, Vec<String>> = file_editors
@@ -173,10 +183,12 @@ fn analyze_single_jsonl(
         ..Default::default()
     };
 
-    let mut seen_msg_ids: HashSet<String> = HashSet::new();
+    let mut usage_indices: HashMap<String, usize> = HashMap::new();
+    let mut usage_records: Vec<(Usage, Vec<ToolInvocation>)> = Vec::new();
     let mut pending_tools: HashMap<String, ToolInvocation> = HashMap::new();
     let mut last_tools: Vec<ToolInvocation> = Vec::new();
-    let mut prev_context_size: u64 = 0;
+    let mut pending_edits: HashSet<String> = HashSet::new();
+    let mut last_failed_edits: HashSet<String> = HashSet::new();
     let mut current_fail_streak: usize = 0;
 
     for line in reader.lines() {
@@ -188,50 +200,41 @@ fn analyze_single_jsonl(
             continue;
         };
 
-        if report.branch.is_none()
-            && let Some(b) = &raw.git_branch
-            && !b.is_empty()
+        if raw.event_type.as_deref() == Some("system")
+            && raw.subtype.as_deref() == Some("compact_boundary")
+            && let Some(metadata) = &raw.compact_metadata
         {
-            report.branch = Some(b.clone());
+            report.compactions.push(CompactionReport {
+                turn: usage_records.len(),
+                before_tokens: metadata.pre_tokens,
+                after_tokens: metadata.post_tokens,
+            });
         }
 
-        let Some(msg) = raw.message else { continue };
+        if let Some(branch) = &raw.git_branch
+            && !branch.is_empty()
+        {
+            report.branch = Some(branch.clone());
+        }
+
+        let Some(msg) = raw.message.as_ref() else {
+            continue;
+        };
 
         if let Some(usage) = msg.usage {
-            let dedup_key = msg.id.clone().or(raw.uuid.clone());
-            let is_new = dedup_key.map(|k| seen_msg_ids.insert(k)).unwrap_or(true);
-
-            if is_new {
-                report.turns += 1;
-                let ctx = usage.context_size();
-                if report.turns == 1 {
-                    report.startup_cache_tokens = usage.cache_creation_input_tokens;
-                } else if ctx > prev_context_size && !last_tools.is_empty() {
-                    let delta = ctx - prev_context_size;
-                    let share = delta / (last_tools.len() as u64);
-                    for tool in &last_tools {
-                        *report
-                            .tool_token_delta
-                            .entry(tool.name.clone())
-                            .or_default() += share;
-                        if share >= heavy_threshold {
-                            let label = format!(
-                                "{} ({})",
-                                tool.name,
-                                tool.target.as_deref().unwrap_or("-")
-                            );
-                            report.heavy_ops.push((label, share));
-                        }
-                    }
+            let dedup_key = msg.id.as_deref().or(raw.uuid.as_deref());
+            let existing = dedup_key.and_then(|key| usage_indices.get(key).copied());
+            if let Some(index) = existing {
+                usage_records[index].0 = usage;
+            } else {
+                if let Some(key) = dedup_key {
+                    usage_indices.insert(key.to_string(), usage_records.len());
                 }
-                report.peak_context_tokens = report.peak_context_tokens.max(ctx);
-                report.total_tokens += usage.total();
-                prev_context_size = ctx;
-                last_tools.clear();
+                usage_records.push((usage, std::mem::take(&mut last_tools)));
             }
         }
 
-        let Some(Value::Array(blocks)) = msg.content else {
+        let Some(Value::Array(blocks)) = msg.content.as_ref() else {
             continue;
         };
 
@@ -251,19 +254,8 @@ fn analyze_single_jsonl(
                         .to_string();
                     let input = block.get("input");
 
-                    let (target, has_line_limit) = extract_tool_target(&name, input);
-                    if name == "Read"
-                        && !has_line_limit
-                        && let Some(ref p) = target
-                    {
-                        *report.full_read_counts.entry(p.clone()).or_default() += 1;
-                    }
-                    if (name == "Edit" || name == "Write" || name == "MultiEdit")
-                        && let Some(ref p) = target
-                    {
-                        report.edited_files.insert(p.clone());
-                    }
-
+                    let (target, has_line_limit) =
+                        extract_tool_target(&name, input, raw.cwd.as_deref());
                     let inv = ToolInvocation {
                         id: id.clone(),
                         name,
@@ -285,22 +277,65 @@ fn analyze_single_jsonl(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if let Some(inv) = pending_tools.remove(tool_use_id) {
-                        if inv.name == "Bash" {
-                            if is_error {
-                                current_fail_streak += 1;
-                                report.max_consecutive_failures =
-                                    report.max_consecutive_failures.max(current_fail_streak);
-                                let snippet = extract_result_snippet(block.get("content"));
+                        let content = block.get("content");
+                        if is_error {
+                            if inv.name == "Bash" {
                                 let cmd = inv.target.unwrap_or_else(|| "bash".into());
-                                report.failed_commands.push((cmd, snippet));
-                            } else {
-                                current_fail_streak = 0;
+                                if is_build_or_test_command(&cmd) {
+                                    if pending_edits.is_empty() {
+                                        current_fail_streak = 0;
+                                        last_failed_edits.clear();
+                                    } else {
+                                        if pending_edits
+                                            .iter()
+                                            .any(|path| last_failed_edits.contains(path))
+                                        {
+                                            current_fail_streak += 1;
+                                        } else {
+                                            current_fail_streak = 1;
+                                        }
+                                        last_failed_edits = std::mem::take(&mut pending_edits);
+                                    }
+                                    report.max_consecutive_failures =
+                                        report.max_consecutive_failures.max(current_fail_streak);
+                                    let snippet = extract_result_snippet(content);
+                                    let cmd =
+                                        cmd.lines().next().unwrap_or("").chars().take(72).collect();
+                                    report.failed_commands.push((cmd, snippet));
+                                }
                             }
-                        } else if (inv.name == "Task" || inv.name == "Agent")
-                            && let Some(desc) = inv.target
-                            && let Some(sub_id) = extract_spawned_agent_id(block.get("content"))
-                        {
-                            report.spawned_tasks.insert(sub_id, desc);
+                            continue;
+                        }
+
+                        match inv.name.as_str() {
+                            "Read" if !inv.has_line_limit => {
+                                if let Some(path) = inv.target {
+                                    *report.full_read_counts.entry(path).or_default() += 1;
+                                }
+                            }
+                            "Edit" | "Write" | "MultiEdit" => {
+                                if let Some(path) = inv.target {
+                                    report
+                                        .edited_files
+                                        .insert(path.clone(), report.branch.clone());
+                                    pending_edits.insert(path);
+                                }
+                            }
+                            "Bash"
+                                if inv.target.as_deref().is_some_and(is_build_or_test_command) =>
+                            {
+                                current_fail_streak = 0;
+                                pending_edits.clear();
+                                last_failed_edits.clear();
+                            }
+                            "Task" | "Agent" => {
+                                if let (Some(desc), Some(sub_id)) =
+                                    (inv.target, raw.spawned_agent_id(content))
+                                {
+                                    report.spawned_tasks.insert(sub_id, desc);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -309,11 +344,41 @@ fn analyze_single_jsonl(
         }
     }
 
+    let mut prev_context_size = 0;
+    for (usage, tools) in usage_records {
+        report.turns += 1;
+        let ctx = usage.context_size();
+        if report.turns == 1 {
+            report.startup_cache_tokens = usage.cache_creation_input_tokens;
+        } else if ctx > prev_context_size && !tools.is_empty() {
+            let delta = ctx - prev_context_size;
+            let share = delta / (tools.len() as u64);
+            for tool in &tools {
+                *report
+                    .tool_token_delta
+                    .entry(tool.name.clone())
+                    .or_default() += share;
+                if share >= heavy_threshold {
+                    let label =
+                        format!("{} ({})", tool.name, tool.target.as_deref().unwrap_or("-"));
+                    report.heavy_ops.push((label, share));
+                }
+            }
+        }
+        report.peak_context_tokens = report.peak_context_tokens.max(ctx);
+        report.total_tokens += usage.total();
+        prev_context_size = ctx;
+    }
+
     report.heavy_ops.sort_by(|a, b| b.1.cmp(&a.1));
     Ok(report)
 }
 
-fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bool) {
+fn extract_tool_target(
+    name: &str,
+    input: Option<&Value>,
+    cwd: Option<&str>,
+) -> (Option<String>, bool) {
     let Some(obj) = input.and_then(|v| v.as_object()) else {
         return (None, false);
     };
@@ -322,7 +387,7 @@ fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bo
             let path = obj
                 .get("file_path")
                 .and_then(|v| v.as_str())
-                .map(String::from);
+                .map(|path| normalize_file_path(path, cwd));
             let limited = obj.contains_key("limit") || obj.contains_key("offset");
             (path, limited)
         }
@@ -330,7 +395,7 @@ fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bo
             let path = obj
                 .get("file_path")
                 .and_then(|v| v.as_str())
-                .map(String::from);
+                .map(|path| normalize_file_path(path, cwd));
             (path, false)
         }
         "Grep" | "Glob" => {
@@ -342,7 +407,7 @@ fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bo
             let cmd = obj
                 .get("command")
                 .and_then(|v| v.as_str())
-                .map(|s| s.lines().next().unwrap_or("").chars().take(72).collect());
+                .map(String::from);
             (cmd, false)
         }
         "Task" | "Agent" => {
@@ -356,28 +421,59 @@ fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bo
     }
 }
 
-/// 从 Task/Agent 的 tool_result 文本中提取 "agentId: xxxxx"
-fn extract_spawned_agent_id(content: Option<&Value>) -> Option<String> {
-    let text = match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => return None,
+fn normalize_file_path(path: &str, cwd: Option<&str>) -> String {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(cwd) = cwd {
+        let cwd = cwd.strip_prefix(r"\\?\").unwrap_or(cwd);
+        Path::new(cwd).join(path)
+    } else {
+        path.to_path_buf()
     };
 
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("agentId:") {
-            let id = rest.trim().trim_matches('"').trim_matches('\'');
-            if !id.is_empty() {
-                return Some(id.to_string());
+    let mut clean = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                clean.pop();
             }
+            _ => clean.push(component.as_os_str()),
         }
     }
-    None
+    let normalized = clean.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+// shortcut: 仅识别常见构建/测试命令，支持其他工具链时扩展此列表。
+fn is_build_or_test_command(command: &str) -> bool {
+    command.split(['&', '|', ';', '\n']).any(|segment| {
+        let mut words = segment
+            .split_whitespace()
+            .skip_while(|word| word.contains('='));
+        let Some(executable) = words.next() else {
+            return false;
+        };
+        let executable = Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(executable)
+            .trim_end_matches(".exe")
+            .trim_end_matches(".bat")
+            .to_ascii_lowercase();
+        match executable.as_str() {
+            "cargo" | "go" => words.any(|word| matches!(word, "build" | "test" | "check")),
+            "npm" | "pnpm" | "yarn" | "bun" => words.any(|word| matches!(word, "build" | "test")),
+            "pytest" | "jest" | "vitest" | "make" => true,
+            _ => false,
+        }
+    })
 }
 
 fn extract_result_snippet(content: Option<&Value>) -> String {
@@ -402,4 +498,301 @@ fn extract_result_snippet(content: Option<&Value>) -> String {
         .chars()
         .take(180)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn tool_call(id: &str, name: &str, input: Value, cwd: Option<&str>) -> String {
+        json!({
+            "cwd": cwd,
+            "message": {"content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}
+        })
+        .to_string()
+    }
+
+    fn tool_result(id: &str, is_error: bool) -> String {
+        json!({
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": id, "content": "result", "is_error": is_error
+            }]}
+        })
+        .to_string()
+    }
+
+    fn analyze(lines: Vec<String>) -> AgentReport {
+        let file_id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "spec-xray-test-{}-{file_id}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&path, lines.join("\n")).unwrap();
+        let report = analyze_single_jsonl(&path, "test", false, 10_000).unwrap();
+        let _ = fs::remove_file(path);
+        report
+    }
+
+    #[test]
+    fn reads_structured_agent_id() {
+        let report = analyze(vec![
+            tool_call(
+                "task-1",
+                "Agent",
+                json!({"description": "Fix parser"}),
+                None,
+            ),
+            json!({
+                "toolUseResult": {"agentId": "agent-123"},
+                "message": {"content": [{
+                    "type": "tool_result", "tool_use_id": "task-1", "content": "done"
+                }]}
+            })
+            .to_string(),
+        ]);
+        assert_eq!(
+            report.spawned_tasks.get("agent-123").map(String::as_str),
+            Some("Fix parser")
+        );
+    }
+
+    #[test]
+    fn uses_final_usage_snapshot() {
+        let report = analyze(vec![
+            json!({"message": {"id": "msg-1", "content": [], "usage": {
+                "input_tokens": 2, "cache_read_input_tokens": 5, "output_tokens": 1
+            }}})
+            .to_string(),
+            json!({"message": {"id": "msg-1", "content": [], "usage": {
+                "input_tokens": 2, "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 5, "output_tokens": 500
+            }}})
+            .to_string(),
+        ]);
+        assert_eq!(report.turns, 1);
+        assert_eq!(report.startup_cache_tokens, 3);
+        assert_eq!(report.peak_context_tokens, 10);
+        assert_eq!(report.total_tokens, 510);
+    }
+
+    #[test]
+    fn ignores_failed_reads_and_edits() {
+        let path = if cfg!(windows) {
+            "E:/repo/a.rs"
+        } else {
+            "/repo/a.rs"
+        };
+        let read = |id| tool_call(id, "Read", json!({"file_path": path}), None);
+        let report = analyze(vec![
+            read("read-1"),
+            tool_result("read-1", true),
+            read("read-2"),
+            tool_result("read-2", true),
+            read("read-3"),
+            tool_result("read-3", false),
+            tool_call(
+                "edit-1",
+                "Edit",
+                json!({"file_path": path, "old_string": "a", "new_string": "b"}),
+                None,
+            ),
+            tool_result("edit-1", true),
+        ]);
+        assert_eq!(report.full_read_counts.values().sum::<usize>(), 1);
+        assert!(report.edited_files.is_empty());
+    }
+
+    #[test]
+    fn counts_only_same_file_build_retries() {
+        let cwd = if cfg!(windows) { "E:/repo" } else { "/repo" };
+        let mut lines = Vec::new();
+        for index in 0..3 {
+            let id = format!("ls-{index}");
+            lines.push(tool_call(
+                &id,
+                "Bash",
+                json!({"command": "ls missing"}),
+                None,
+            ));
+            lines.push(tool_result(&id, true));
+        }
+        for index in 0..3 {
+            let edit_id = format!("edit-{index}");
+            let test_id = format!("test-{index}");
+            lines.push(tool_call(
+                &edit_id,
+                "Edit",
+                json!({"file_path": "src/a.rs", "old_string": "a", "new_string": "b"}),
+                Some(cwd),
+            ));
+            lines.push(tool_result(&edit_id, false));
+            lines.push(tool_call(
+                &test_id,
+                "Bash",
+                json!({"command": "cargo test"}),
+                None,
+            ));
+            lines.push(tool_result(&test_id, true));
+        }
+        let report = analyze(lines);
+        assert_eq!(report.max_consecutive_failures, 3);
+        assert_eq!(report.failed_commands.len(), 3);
+        assert!(
+            report
+                .failed_commands
+                .iter()
+                .all(|(cmd, _)| cmd == "cargo test")
+        );
+    }
+
+    #[test]
+    fn normalizes_read_and_edit_paths() {
+        let cwd = if cfg!(windows) {
+            "E:/Repo"
+        } else {
+            "/tmp/Repo"
+        };
+        let absolute = Path::new(cwd)
+            .join("src/./lib.rs")
+            .to_string_lossy()
+            .to_string();
+        let absolute = if cfg!(windows) {
+            absolute.replace('/', "\\")
+        } else {
+            absolute
+        };
+        let expected = normalize_file_path("src/lib.rs", Some(cwd));
+        let mut lines = Vec::new();
+        for (index, path) in ["src/lib.rs".to_string(), absolute].into_iter().enumerate() {
+            let read_id = format!("read-{index}");
+            let edit_id = format!("edit-{index}");
+            lines.push(tool_call(
+                &read_id,
+                "Read",
+                json!({"file_path": path}),
+                Some(cwd),
+            ));
+            lines.push(tool_result(&read_id, false));
+            lines.push(tool_call(
+                &edit_id,
+                "Write",
+                json!({"file_path": path, "content": "fn main() {}"}),
+                Some(cwd),
+            ));
+            lines.push(tool_result(&edit_id, false));
+        }
+        let report = analyze(lines);
+        assert_eq!(report.full_read_counts.get(&expected), Some(&2));
+        assert_eq!(report.full_read_counts.len(), 1);
+        assert!(report.edited_files.contains_key(&expected));
+        assert_eq!(report.edited_files.len(), 1);
+    }
+
+    #[test]
+    fn records_branch_for_each_edited_file() {
+        let edit = |id: &str, path: &str, branch: &str| {
+            json!({
+                "gitBranch": branch,
+                "message": {"content": [{
+                    "type": "tool_use", "id": id, "name": "Edit",
+                    "input": {"file_path": path, "old_string": "a", "new_string": "b"}
+                }]}
+            })
+            .to_string()
+        };
+        let (first, second) = if cfg!(windows) {
+            ("E:/repo/a.rs", "E:/repo/b.rs")
+        } else {
+            ("/repo/a.rs", "/repo/b.rs")
+        };
+        let report = analyze(vec![
+            edit("edit-1", first, "master"),
+            tool_result("edit-1", false),
+            edit("edit-2", second, "feature/x"),
+            tool_result("edit-2", false),
+        ]);
+        assert_eq!(report.branch.as_deref(), Some("feature/x"));
+        assert_eq!(
+            report
+                .edited_files
+                .get(&normalize_file_path(first, None))
+                .and_then(|branch| branch.as_deref()),
+            Some("master")
+        );
+        assert_eq!(
+            report
+                .edited_files
+                .get(&normalize_file_path(second, None))
+                .and_then(|branch| branch.as_deref()),
+            Some("feature/x")
+        );
+    }
+
+    #[test]
+    fn records_compact_boundaries_without_usage_inference() {
+        let usage = |id: &str, context: u64| {
+            json!({"message": {
+                "id": id, "content": [], "usage": {"input_tokens": context}
+            }})
+            .to_string()
+        };
+        let report = analyze(vec![
+            usage("msg-1", 100),
+            json!({
+                "type": "system", "subtype": "compact_boundary",
+                "compactMetadata": {"trigger": "auto", "preTokens": 80}
+            })
+            .to_string(),
+            usage("msg-2", 200),
+            json!({
+                "type": "system", "subtype": "compact_boundary",
+                "compactMetadata": {"trigger": "auto", "preTokens": 180, "postTokens": 20}
+            })
+            .to_string(),
+        ]);
+        assert_eq!(report.compactions.len(), 2);
+        assert_eq!(report.compactions[0].turn, 1);
+        assert_eq!(report.compactions[0].before_tokens, 80);
+        assert_eq!(report.compactions[0].after_tokens, None);
+        assert_eq!(report.compactions[1].turn, 2);
+        assert_eq!(report.compactions[1].before_tokens, 180);
+        assert_eq!(report.compactions[1].after_tokens, Some(20));
+
+        let markdown = crate::report::render_markdown(&SessionReport {
+            project_dir: std::env::temp_dir().join("spec-xray-render-test-no-logs"),
+            session_id: "test".to_string(),
+            agents: vec![report],
+            file_clashes: BTreeMap::new(),
+        });
+        assert!(markdown.contains("Compaction（已完成 1 轮后）"));
+        assert!(markdown.contains("80 → 未知 tokens"));
+        assert!(markdown.contains("Compaction（已完成 2 轮后）"));
+        assert!(markdown.contains("180 → 20 tokens（下降 160）"));
+    }
+
+    #[test]
+    fn ignores_microcompact_context_drops() {
+        let usage = |id: &str, context: u64| {
+            json!({"message": {
+                "id": id, "content": [], "usage": {"input_tokens": context}
+            }})
+            .to_string()
+        };
+        let report = analyze(vec![
+            usage("msg-1", 200),
+            json!({
+                "type": "system", "subtype": "microcompact_boundary",
+                "microcompactMetadata": {
+                    "preTokens": 200, "tokensSaved": 180, "compactedToolIds": ["tool-1"]
+                }
+            })
+            .to_string(),
+            usage("msg-2", 20),
+        ]);
+        assert!(report.compactions.is_empty());
+    }
 }

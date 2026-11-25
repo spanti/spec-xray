@@ -7,14 +7,58 @@ pub struct RawLine {
     pub uuid: Option<String>,
     #[serde(rename = "type")]
     pub event_type: Option<String>,
+    pub subtype: Option<String>,
     pub timestamp: Option<String>,
+    pub cwd: Option<String>,
     #[serde(rename = "gitBranch")]
     pub git_branch: Option<String>,
     #[serde(rename = "isSidechain")]
     pub is_sidechain: Option<bool>,
     #[serde(rename = "parentToolUseID")]
     pub parent_tool_use_id: Option<String>,
+    #[serde(rename = "toolUseResult")]
+    pub tool_use_result: Option<Value>,
+    #[serde(rename = "compactMetadata")]
+    pub compact_metadata: Option<CompactMetadata>,
     pub message: Option<MessageBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompactMetadata {
+    #[serde(rename = "preTokens")]
+    pub pre_tokens: u64,
+    #[serde(rename = "postTokens")]
+    pub post_tokens: Option<u64>,
+}
+
+impl RawLine {
+    pub fn spawned_agent_id(&self, content: Option<&Value>) -> Option<String> {
+        if let Some(id) = self
+            .tool_use_result
+            .as_ref()
+            .and_then(|r| r.get("agentId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            return Some(id.to_string());
+        }
+
+        let text = match content {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => return None,
+        };
+        text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("agentId:")
+                .map(|rest| rest.trim().trim_matches('"').trim_matches('\'').to_string())
+                .filter(|id| !id.is_empty())
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
