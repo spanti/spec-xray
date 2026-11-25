@@ -14,6 +14,24 @@ pub struct CompactionReport {
     pub after_tokens: Option<u64>,
 }
 
+#[derive(Debug)]
+pub struct ToolAction {
+    pub turn: usize,
+    pub tool: String,
+    pub target: Option<String>,
+    pub delta: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct MergeAudit {
+    pub agent_id: String,
+    pub action: String,
+    pub build_success: Option<bool>,
+    pub build_error: Option<String>,
+    pub suspect_files: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct AgentReport {
     pub agent_id: String,
@@ -38,6 +56,9 @@ pub struct AgentReport {
     pub failed_commands: Vec<(String, String)>,
     /// 连续失败死循环次数（连续 >=3 次失败记为风暴）
     pub max_consecutive_failures: usize,
+    /// 按日志顺序记录的工具调用流水
+    pub actions: Vec<ToolAction>,
+    merge_audits: Vec<MergeAudit>,
     /// 内部使用：派发的 subagent_id -> 任务描述映射
     pub spawned_tasks: HashMap<String, String>,
 }
@@ -49,6 +70,7 @@ pub struct SessionReport {
     pub agents: Vec<AgentReport>,
     /// 跨 Agent 文件修改碰撞：文件路径 -> 修改过该文件的显示名称列表
     pub file_clashes: BTreeMap<String, Vec<String>>,
+    pub merge_audits: Vec<MergeAudit>,
 }
 
 /// 将本地工作目录路径映射为 ~/.claude/projects/<encoded-path>
@@ -160,11 +182,17 @@ pub fn analyze_session(
         .filter(|(_, editors)| editors.len() >= 2)
         .collect();
 
+    let merge_audits = agents
+        .iter_mut()
+        .flat_map(|agent| std::mem::take(&mut agent.merge_audits))
+        .collect();
+
     Ok(SessionReport {
         project_dir: proj_dir.to_path_buf(),
         session_id: session_id.to_string(),
         agents,
         file_clashes,
+        merge_audits,
     })
 }
 
@@ -186,6 +214,7 @@ fn analyze_single_jsonl(
     let mut usage_indices: HashMap<String, usize> = HashMap::new();
     let mut usage_records: Vec<(Usage, Vec<ToolInvocation>)> = Vec::new();
     let mut pending_tools: HashMap<String, ToolInvocation> = HashMap::new();
+    let mut tool_errors: HashMap<String, String> = HashMap::new();
     let mut last_tools: Vec<ToolInvocation> = Vec::new();
     let mut pending_edits: HashSet<String> = HashSet::new();
     let mut last_failed_edits: HashSet<String> = HashSet::new();
@@ -279,6 +308,38 @@ fn analyze_single_jsonl(
                     if let Some(inv) = pending_tools.remove(tool_use_id) {
                         let content = block.get("content");
                         if is_error {
+                            tool_errors
+                                .insert(tool_use_id.to_string(), extract_result_snippet(content));
+                        }
+                        if !is_error
+                            && inv.name == "Bash"
+                            && inv.target.as_deref().is_some_and(is_merge_command)
+                        {
+                            let mut suspect_files: Vec<_> =
+                                report.edited_files.keys().cloned().collect();
+                            suspect_files.sort();
+                            report.merge_audits.push(MergeAudit {
+                                agent_id: agent_id.to_string(),
+                                action: inv.target.clone().unwrap_or_else(|| "git merge".into()),
+                                build_success: None,
+                                build_error: None,
+                                suspect_files,
+                            });
+                        }
+                        if inv.name == "Bash"
+                            && inv.target.as_deref().is_some_and(is_build_or_test_command)
+                        {
+                            let error = is_error.then(|| extract_result_snippet(content));
+                            for audit in report
+                                .merge_audits
+                                .iter_mut()
+                                .filter(|audit| audit.build_success.is_none())
+                            {
+                                audit.build_success = Some(!is_error);
+                                audit.build_error = error.clone();
+                            }
+                        }
+                        if is_error {
                             if inv.name == "Bash" {
                                 let cmd = inv.target.unwrap_or_else(|| "bash".into());
                                 if is_build_or_test_command(&cmd) {
@@ -348,27 +409,44 @@ fn analyze_single_jsonl(
     for (usage, tools) in usage_records {
         report.turns += 1;
         let ctx = usage.context_size();
+        let mut action_delta = 0;
         if report.turns == 1 {
             report.startup_cache_tokens = usage.cache_creation_input_tokens;
         } else if ctx > prev_context_size && !tools.is_empty() {
             let delta = ctx - prev_context_size;
-            let share = delta / (tools.len() as u64);
+            action_delta = delta / (tools.len() as u64);
             for tool in &tools {
                 *report
                     .tool_token_delta
                     .entry(tool.name.clone())
-                    .or_default() += share;
-                if share >= heavy_threshold {
+                    .or_default() += action_delta;
+                if action_delta >= heavy_threshold {
                     let label =
                         format!("{} ({})", tool.name, tool.target.as_deref().unwrap_or("-"));
-                    report.heavy_ops.push((label, share));
+                    report.heavy_ops.push((label, action_delta));
                 }
             }
         }
+        report.actions.extend(tools.iter().map(|tool| ToolAction {
+            turn: report.turns,
+            tool: tool.name.clone(),
+            target: tool.target.clone(),
+            delta: action_delta,
+            error: tool_errors.get(&tool.id).cloned(),
+        }));
         report.peak_context_tokens = report.peak_context_tokens.max(ctx);
         report.total_tokens += usage.total();
         prev_context_size = ctx;
     }
+    report
+        .actions
+        .extend(last_tools.iter().map(|tool| ToolAction {
+            turn: report.turns + 1,
+            tool: tool.name.clone(),
+            target: tool.target.clone(),
+            delta: 0,
+            error: tool_errors.get(&tool.id).cloned(),
+        }));
 
     report.heavy_ops.sort_by(|a, b| b.1.cmp(&a.1));
     Ok(report)
@@ -449,6 +527,24 @@ fn normalize_file_path(path: &str, cwd: Option<&str>) -> String {
     } else {
         normalized
     }
+}
+
+fn is_merge_command(command: &str) -> bool {
+    command.split(['&', '|', ';', '\n']).any(|segment| {
+        let mut words = segment
+            .split_whitespace()
+            .skip_while(|word| word.contains('='));
+        let Some(executable) = words.next() else {
+            return false;
+        };
+        Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(executable)
+            .trim_end_matches(".exe")
+            .eq_ignore_ascii_case("git")
+            && words.next() == Some("merge")
+    })
 }
 
 // shortcut: 仅识别常见构建/测试命令，支持其他工具链时扩展此列表。
@@ -767,11 +863,62 @@ mod tests {
             session_id: "test".to_string(),
             agents: vec![report],
             file_clashes: BTreeMap::new(),
+            merge_audits: Vec::new(),
         });
         assert!(markdown.contains("Compaction（已完成 1 轮后）"));
         assert!(markdown.contains("80 → 未知 tokens"));
         assert!(markdown.contains("Compaction（已完成 2 轮后）"));
         assert!(markdown.contains("180 → 20 tokens（下降 160）"));
+    }
+
+    #[test]
+    fn records_action_delta_and_error() {
+        let report = analyze(vec![
+            json!({"message": {"id": "msg-1", "content": [], "usage": {
+                "input_tokens": 100
+            }}})
+            .to_string(),
+            tool_call("read-1", "Read", json!({"file_path": "a.rs"}), None),
+            json!({"message": {"content": [{
+                "type": "tool_result", "tool_use_id": "read-1", "content": "missing file",
+                "is_error": true
+            }]}})
+            .to_string(),
+            json!({"message": {"id": "msg-2", "content": [], "usage": {
+                "input_tokens": 160
+            }}})
+            .to_string(),
+        ]);
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].turn, 2);
+        assert_eq!(report.actions[0].delta, 60);
+        assert_eq!(report.actions[0].error.as_deref(), Some("missing file"));
+    }
+
+    #[test]
+    fn audits_first_build_after_merge() {
+        let report = analyze(vec![
+            tool_call(
+                "edit-1",
+                "Edit",
+                json!({"file_path": "src/a.rs", "old_string": "a", "new_string": "b"}),
+                None,
+            ),
+            tool_result("edit-1", false),
+            tool_call(
+                "merge-1",
+                "Bash",
+                json!({"command": "git merge feature"}),
+                None,
+            ),
+            tool_result("merge-1", false),
+            tool_call("build-1", "Bash", json!({"command": "cargo test"}), None),
+            tool_result("build-1", true),
+        ]);
+        assert_eq!(report.merge_audits.len(), 1);
+        assert_eq!(report.merge_audits[0].build_success, Some(false));
+        assert_eq!(report.merge_audits[0].suspect_files.len(), 1);
+        assert!(report.merge_audits[0].build_error.is_some());
     }
 
     #[test]

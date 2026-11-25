@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
-use spec_xray::{analyzer::analyzer, report};
 use clap::{Parser, Subcommand};
+use spec_xray::{analyzer::analyzer, report};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -39,6 +39,8 @@ enum Commands {
     Latest,
     /// 分析指定主会话 UUID
     Inspect { session_id: String },
+    /// 打开实时 TUI 诊断面板（默认加载最新会话）
+    Tui { session_id: Option<String> },
 }
 
 fn main() -> Result<()> {
@@ -64,6 +66,9 @@ fn main() -> Result<()> {
         Commands::Inspect { session_id } => {
             let rep = analyzer::analyze_session(&proj_dir, &session_id, cli.threshold)?;
             emit_report(&report::render_markdown(&rep), &cli.output)?;
+        }
+        Commands::Tui { session_id } => {
+            spec_xray::ui::run(&proj_dir, session_id.as_deref(), cli.threshold)?;
         }
     }
 
