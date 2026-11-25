@@ -3,12 +3,17 @@ mod report;
 mod schema;
 
 use anyhow::{Context, Result, bail};
-use arboard::Clipboard;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Parser)]
-#[command(name = "spec-xray", about = "Claude Code Subagent 上下文与合并诊断分析器")]
+#[command(
+    name = "spec-xray",
+    about = "Claude Code Subagent 上下文与合并诊断分析器"
+)]
 struct Cli {
     /// 目标项目工作目录（默认为当前目录）
     #[arg(long, global = true, default_value = ".")]
@@ -18,15 +23,15 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 10_000)]
     threshold: u64,
 
-    /// 将诊断报告直接写入系统剪贴板（不重复输出到终端）
-    #[arg(long, global = true)]
-    copy: bool,
+    /// 诊断报告输出路径（默认写入当前目录的 output.log，不重复输出到终端）
+    #[arg(long, global = true, default_value = "output.log")]
+    output: PathBuf,
 
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug, Clone)]
 enum Commands {
     /// 列出当前项目最近的会话 UUID
     List {
@@ -57,28 +62,21 @@ fn main() -> Result<()> {
             let sessions = analyzer::list_sessions(&proj_dir)?;
             let (latest_id, _) = sessions.first().context("当前项目下没有任何会话日志")?;
             let rep = analyzer::analyze_session(&proj_dir, latest_id, cli.threshold)?;
-            emit_report(&report::render_markdown(&rep), cli.copy)?;
+            emit_report(&report::render_markdown(&rep), &cli.output)?;
         }
         Commands::Inspect { session_id } => {
             let rep = analyzer::analyze_session(&proj_dir, &session_id, cli.threshold)?;
-            emit_report(&report::render_markdown(&rep), cli.copy)?;
+            emit_report(&report::render_markdown(&rep), &cli.output)?;
         }
     }
 
     Ok(())
 }
 
-fn emit_report(markdown: &str, to_clipboard: bool) -> Result<()> {
-    if !to_clipboard {
-        print!("{markdown}");
-        return Ok(());
-    }
+fn emit_report(markdown: &str, output: &Path) -> Result<()> {
+    fs::write(output, markdown)
+        .with_context(|| format!("写入诊断报告到 {} 失败", output.display()))?;
 
-    let mut clipboard = Clipboard::new().context("初始化系统剪贴板失败")?;
-    clipboard
-        .set_text(markdown.to_owned())
-        .context("写入诊断报告到剪贴板失败")?;
-
-    eprintln!("诊断报告已复制到系统剪贴板。");
+    eprintln!("诊断报告已写入 {}。", output.display());
     Ok(())
 }

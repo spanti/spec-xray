@@ -62,7 +62,11 @@ pub fn resolve_project_dir(work_dir: &Path) -> Result<PathBuf> {
 
     if let Ok(entries) = fs::read_dir(&projects_root) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(&encoded) {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&encoded)
+            {
                 return Ok(entry.path());
             }
         }
@@ -89,7 +93,11 @@ pub fn list_sessions(proj_dir: &Path) -> Result<Vec<(String, std::time::SystemTi
 }
 
 /// 加载主会话及同目录下的 subagents/*.jsonl 并执行全量诊断
-pub fn analyze_session(proj_dir: &Path, session_id: &str, heavy_threshold: u64) -> Result<SessionReport> {
+pub fn analyze_session(
+    proj_dir: &Path,
+    session_id: &str,
+    heavy_threshold: u64,
+) -> Result<SessionReport> {
     let main_file = proj_dir.join(format!("{session_id}.jsonl"));
     if !main_file.exists() {
         bail!("主会话日志不存在: {}", main_file.display());
@@ -202,7 +210,10 @@ fn analyze_single_jsonl(
                     let delta = ctx - prev_context_size;
                     let share = delta / (last_tools.len() as u64);
                     for tool in &last_tools {
-                        *report.tool_token_delta.entry(tool.name.clone()).or_default() += share;
+                        *report
+                            .tool_token_delta
+                            .entry(tool.name.clone())
+                            .or_default() += share;
                         if share >= heavy_threshold {
                             let label = format!(
                                 "{} ({})",
@@ -228,8 +239,16 @@ fn analyze_single_jsonl(
             let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match btype {
                 "tool_use" => {
-                    let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+                    let id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
                     let input = block.get("input");
 
                     let (target, has_line_limit) = extract_tool_target(&name, input);
@@ -257,8 +276,14 @@ fn analyze_single_jsonl(
                     last_tools.push(inv);
                 }
                 "tool_result" => {
-                    let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let is_error = block
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if let Some(inv) = pending_tools.remove(tool_use_id) {
                         if inv.name == "Bash" {
                             if is_error {
@@ -294,12 +319,18 @@ fn extract_tool_target(name: &str, input: Option<&Value>) -> (Option<String>, bo
     };
     match name {
         "Read" => {
-            let path = obj.get("file_path").and_then(|v| v.as_str()).map(String::from);
+            let path = obj
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let limited = obj.contains_key("limit") || obj.contains_key("offset");
             (path, limited)
         }
         "Edit" | "Write" | "MultiEdit" => {
-            let path = obj.get("file_path").and_then(|v| v.as_str()).map(String::from);
+            let path = obj
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             (path, false)
         }
         "Grep" | "Glob" => {
